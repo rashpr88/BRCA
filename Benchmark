@@ -1,0 +1,904 @@
+"""
+benchmark.py
+Run order: run this AFTER the network-selection script, since it reads the
+winner network name + locked feature config from
+`multi_network/ablation_detail.json` if present (falls back to sane
+defaults otherwise).
+"""
+
+import os, gc, csv, json, time, warnings, hashlib
+import numpy as np
+import pandas as pd
+import networkx as nx
+import scipy.sparse as sp
+import h5py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sklearn.preprocessing import normalize, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (average_precision_score, roc_auc_score,
+                              precision_recall_curve)
+from scipy.stats import hypergeom, norm
+
+warnings.filterwarnings("ignore")
+
+try:
+    from torch_geometric.nn import GCNConv, GATConv
+    _HAS_PYG = True
+except ImportError:
+    _HAS_PYG = False
+    print("⚠  torch_geometric not found — GNNs use manual fallback layers")
+
+try:
+    import xgboost as xgb
+    _HAS_XGB = True
+except ImportError:
+    _HAS_XGB = False
+    print("⚠  xgboost not found — N2V_XGB will be skipped")
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# CONFIG
+
+BASE = "/content/drive/MyDrive/MMSE BC/"
+
+CFG = dict(
+    gml_path   = BASE + "multi_network/string_union_cpdb.gml",
+    h5_path    = BASE + "Copy of node_embeddings_filtered_new4.h5",
+    label_path = BASE + "Copy of Breast_Cancer_360_V2_Gene_List.xlsx",
+    omics_csv  = BASE + "stage3/stage3c_omics_features.csv",
+    ppi_cache  = BASE + "ppi_cache/",
+    ablation_json = BASE + "multi_network/ablation_detail.json",
+    out_dir    = BASE + "benchmark/",
+
+    # Fixed test-set construction — must match the main pipeline exactly.
+    HP_TEST_SEED  = 2024, U_TEST_SEED = 2025, NEG_TEST_SEED = 2026,
+    HP_TEST_FRAC  = 0.20,   # int(0.20 * 88) = 17
+    U_TEST_RATIO  = 50,     # 17 × 50 = 850
+
+    # Engineered-feature (MMSE-BC) training
+    BASE_SEED = 42, NEG_RATIO = 10, RWR_ALPHA = 0.15, RWR_ITER = 50,
+
+    # GNN training
+    n_repeats = 5, epochs = 300, patience = 40, lr = 3e-4, dropout = 0.5,
+
+    # PPI cache hashing (must mirror the main pipeline's cache keys)
+    n2v_dim=128, n2v_p=1.0, n2v_q=0.5, n2v_walk_length=20,
+    n2v_walks_per_node=10, n2v_context_size=10, n2v_epochs=3,
+    rwr_dim=64, rwr_alpha=0.98, rwr_T=3, netmf_dim=64, netmf_window=10,
+)
+os.makedirs(CFG["out_dir"], exist_ok=True)
+os.makedirs(CFG["ppi_cache"], exist_ok=True)
+
+DEFAULT_LOCKED_FEATS = ["max_seq", "rwr", "mut"]   # fallback if no ablation_detail.json
+
+# DATA LOADING
+
+
+def _ppi_cache_hash(nodes):
+    c = CFG
+    key = (f"n2v{c['n2v_dim']}_p{c['n2v_p']}_q{c['n2v_q']}_wl{c['n2v_walk_length']}_"
+           f"wpn{c['n2v_walks_per_node']}_ep{c['n2v_epochs']}_rwr{c['rwr_dim']}_"
+           f"a{c['rwr_alpha']}_T{c['rwr_T']}_netmf{c['netmf_dim']}_w{c['netmf_window']}_"
+           f"N{len(nodes)}_n0{str(nodes[0])}_nN{str(nodes[-1])}")
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def _load_ppi_feature_stack(G, nodes):
+    """struct(6) + N2V(128) + RWR-PPMI(64) + NetMF(64) = 262 dims, cached."""
+    h = _ppi_cache_hash(nodes)
+
+    def _try(tag):
+        p = os.path.join(CFG["ppi_cache"], f"ppi_{tag}_{h}.npy")
+        return np.load(p) if os.path.exists(p) else None
+
+    struct_f = _try("struct")
+    if struct_f is None:
+        deg, clust = dict(G.degree()), nx.clustering(G)
+        btwn = nx.betweenness_centrality(G, k=500, normalized=True, seed=42)
+        struct_f = np.array([
+            [deg[n], np.log1p(deg[n]), clust[n], btwn[n],
+             np.mean([deg[nb] for nb in G.neighbors(n)] or [0]),
+             np.max([deg[nb] for nb in G.neighbors(n)] or [0])]
+            for n in nodes], dtype=np.float32)
+
+    n2v_f = _try("n2v")
+    if n2v_f is None:
+        print("  ⚠  N2V cache miss — using random init (run main pipeline once to cache)")
+        n2v_f = np.random.RandomState(42).randn(len(nodes), CFG["n2v_dim"]).astype(np.float32)
+
+    rwr_f = _try("rwr") if _try("rwr") is not None else np.zeros((len(nodes), 64), np.float32)
+    netmf_f = _try("netmf") if _try("netmf") is not None else np.zeros((len(nodes), 64), np.float32)
+
+    ppi_X = np.hstack([struct_f, n2v_f, rwr_f, netmf_f]).astype(np.float32)
+    return ppi_X, n2v_f.astype(np.float32)
+
+
+def load_data() -> dict:
+    """
+    Load graph + all feature modalities + carve the fixed test split.
+    Mirrors benchmark.py exactly, plus loads "seq" (ProtT5) embeddings
+    and omics (mut/cna/expr) needed for the engineered/locked features.
+    """
+    print(f"Device: {DEVICE}\n📂 Loading graph…")
+    G = nx.read_gml(CFG["gml_path"])
+    nodes = list(G.nodes()); N = len(nodes)
+    g2i = {n: i for i, n in enumerate(nodes)}
+    print(f"  {N} nodes | {G.number_of_edges()} edges")
+
+    # ── Labels ────────────────────────────────────────────────────
+    df = pd.read_excel(CFG["label_path"], sheet_name="Genes")
+    hp_names = set(df["Genes"].dropna().astype(str))
+    try:
+        neg_names = set(df["Negatives"].dropna().astype(str))
+    except KeyError:
+        neg_names = set()
+
+    y = np.zeros(N, np.float32)
+    for i, n in enumerate(nodes):
+        if str(n) in hp_names:
+            y[i] = 1.0
+    hp_idx = np.where(y == 1.0)[0]
+    neg_idx = np.array([i for i, n in enumerate(nodes) if str(n) in neg_names], np.int64)
+    unlabeled_idx = np.setdiff1d(np.where(y == 0.0)[0], neg_idx)
+    print(f"  HP={len(hp_idx)}  NEG={len(neg_idx)}  U={len(unlabeled_idx)}")
+
+    # ── Fixed test split ─────────────────────────────────────────
+    hp_perm = np.random.RandomState(CFG["HP_TEST_SEED"]).permutation(hp_idx)
+    n_hp_test = max(1, int(CFG["HP_TEST_FRAC"] * len(hp_idx)))
+    hp_test, hp_train = hp_perm[:n_hp_test], hp_perm[n_hp_test:]
+
+    u_perm = np.random.RandomState(CFG["U_TEST_SEED"]).permutation(unlabeled_idx)
+    n_u_test = min(n_hp_test * CFG["U_TEST_RATIO"], len(unlabeled_idx) // 2)
+    u_test = u_perm[:n_u_test]
+
+    if len(neg_idx) > 0:
+        neg_perm = np.random.RandomState(CFG["NEG_TEST_SEED"]).permutation(neg_idx)
+        n_neg_test = max(1, int(CFG["HP_TEST_FRAC"] * len(neg_idx)))
+        neg_test, neg_train = neg_perm[:n_neg_test], neg_perm[n_neg_test:]
+    else:
+        neg_test = neg_train = np.array([], np.int64)
+
+    test_idx = np.unique(np.concatenate([hp_test, u_test, neg_test]))
+    y_test = np.zeros(N, np.float32); y_test[hp_test] = 1.0   # positives = HP test only
+
+    excluded = set(test_idx.tolist()) | set(neg_idx.tolist())
+    u_pool = np.array([i for i in unlabeled_idx if i not in excluded])
+    n_u_tr = min(len(hp_train) * 15, 5000, len(u_pool))
+    u_train = np.random.RandomState(42).choice(u_pool, size=n_u_tr, replace=False)
+    train_idx = np.unique(np.concatenate([hp_train, u_train, neg_train]))
+
+    print(f"  HP test={len(hp_test)} (train={len(hp_train)}) | U test={len(u_test)} | "
+          f"NEG test={len(neg_test)} | Test={len(test_idx)} | Train={len(train_idx)}")
+
+    # ── Embeddings: seq (ProtT5) + struct + go ──────────────────────
+    print("📂 Loading modality embeddings…")
+    mods = {}
+    with h5py.File(CFG["h5_path"], "r") as f:
+        for key in ["seq", "struct", "go"]:
+            if key not in f:
+                continue
+            avail = set(f[key].keys())
+            s0 = next(iter(avail))
+            d = np.asarray(f[key][s0][()]).flatten().shape[0]
+            M = np.zeros((N, d), np.float32)
+            for i, n in enumerate(nodes):
+                if str(n) in avail:
+                    M[i] = np.asarray(f[key][str(n)][()]).flatten()
+            M = StandardScaler().fit_transform(M).astype(np.float32)
+            mods[key] = normalize(M, axis=1).astype(np.float32)
+    print("  " + ", ".join(f"{k}:{v.shape[1]}d" for k, v in mods.items()))
+
+    # ── Omics: mut/cna/expr (global z-score, scalars) ──────────────
+    omics = {}
+    g2i_str = {str(n): i for n, i in g2i.items()}
+    raw = {k: np.zeros(N, np.float32) for k in ["mut", "cna", "expr"]}
+    km = {"mut_freq": "mut", "cna_freq": "cna", "expr_zscore": "expr"}
+    if os.path.exists(CFG["omics_csv"]):
+        with open(CFG["omics_csv"]) as f:
+            for row in csv.DictReader(f):
+                if row["gene"] in g2i_str:
+                    i = g2i_str[row["gene"]]
+                    for col, key in km.items():
+                        if col in row:
+                            raw[key][i] = float(row[col])
+    for k, v in raw.items():
+        mu, sd = v.mean(), v.std()
+        omics[k] = ((v - mu) / max(sd, 1e-9)).astype(np.float32)
+
+    # ── Full PPI feature stack (struct+N2V+RWR-PPMI+NetMF), cached ──
+    print("📂 Building PPI feature stack…")
+    ppi_X, n2v_X = _load_ppi_feature_stack(G, nodes)
+
+    def _scale(X):
+        sc = StandardScaler().fit(X[train_idx])
+        return sc.transform(X).astype(np.float32)
+
+    struct_s, go_s, ppi_s, n2v_s = (_scale(mods.get("struct", np.zeros((N, 1), np.float32))),
+                                     _scale(mods.get("go", np.zeros((N, 1), np.float32))),
+                                     _scale(ppi_X), _scale(n2v_X))
+    X_full = np.hstack([struct_s, go_s, ppi_s]).astype(np.float32)
+
+    # ── Graph structures: sparse adjacency + row-normalized walk matrix ─
+    A = nx.to_scipy_sparse_array(G, nodelist=nodes, weight="weight", format="csr", dtype=np.float64)
+    deg = np.asarray(A.sum(1)).flatten(); deg_safe = np.where(deg == 0, 1.0, deg)
+    W = (sp.diags(1.0 / deg_safe) @ A).tocsr()
+    log_deg = np.log1p(deg).astype(np.float32)
+
+    rows, cols = [], []
+    for u, v in G.edges():
+        i, j = g2i[u], g2i[v]
+        rows += [i, j]; cols += [j, i]
+    edge_index = torch.tensor([rows, cols], dtype=torch.long)
+
+    return dict(
+        G=G, nodes=nodes, N=N, g2i=g2i,
+        y=y, y_test=y_test,
+        hp_train=hp_train, hp_test=hp_test,
+        neg_idx=neg_idx, neg_train=neg_train, neg_test=neg_test,
+        train_idx=train_idx, test_idx=test_idx,
+        mods=mods, omics=omics, log_deg=log_deg,
+        A=A, W=W, deg=deg, edge_index=edge_index,
+        X_full=X_full, X_n2v=n2v_s,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CLASSICAL TOPOLOGY METHODS (no training — purely graph-based)
+# ═══════════════════════════════════════════════════════════════════════
+
+def rwr_fn(W, N, seeds, alpha=CFG["RWR_ALPHA"], n_iter=CFG["RWR_ITER"]):
+    s = np.zeros(N, np.float32); s[seeds] = 1. / len(seeds); r = s.copy()
+    for _ in range(n_iter):
+        r = (1 - alpha) * (W.T @ r) + alpha * s
+    return r
+
+
+def markov2_fn(W, N, seeds):
+    s = np.zeros(N, np.float32); s[seeds] = 1. / len(seeds)
+    return (W.T @ (W.T @ s)).astype(np.float32)
+
+
+def mv_scores_fn(A, N, hp_set):
+    """Direct-neighbor majority-vote score: count of HP neighbors."""
+    sm = np.zeros(N, bool); sm[list(hp_set)] = True
+    return np.array([sm[A.indices[A.indptr[i]:A.indptr[i + 1]]].sum()
+                      for i in range(N)], np.float32)
+
+
+def hishigaki_fn(A, N, hp_set):
+    """Hishigaki et al. 2001 — hypergeometric enrichment of HP neighbors."""
+    deg = np.asarray(A.sum(1)).flatten().astype(int); n_hp = len(hp_set)
+    s = np.zeros(N, np.float64)
+    for i in range(N):
+        if i in hp_set:
+            continue
+        nbrs = A.indices[A.indptr[i]:A.indptr[i + 1]]
+        ki, xi = int(deg[i]), int(sum(1 for nb in nbrs if nb in hp_set))
+        if ki == 0 or xi == 0:
+            continue
+        s[i] = -np.log10(max(hypergeom.sf(xi - 1, N, n_hp, ki), 1e-300))
+    return s
+
+
+def niapu_fn(W, A, N, hp_set, alpha=0.85, beta=0.5):
+    """NIAPU — blend of global RWR and local HP-weighted neighbor score."""
+    r = rwr_fn(W, N, list(hp_set), alpha=beta)
+    deg = np.asarray(A.sum(1)).flatten(); deg[deg == 0] = 1.0
+    local = np.zeros(N, np.float64)
+    for i in range(N):
+        nbrs = A.indices[A.indptr[i]:A.indptr[i + 1]]
+        local[i] = sum(float(r[nb]) for nb in nbrs if nb in hp_set) / deg[i]
+    n01 = lambda x: (x - x.min()) / (x.max() - x.min() + 1e-12)
+    s = alpha * n01(r.astype(np.float64)) + (1 - alpha) * n01(local)
+    for i in hp_set:
+        s[i] = 0.0
+    return s
+
+
+def local_nbr_fn(G, nodes, hp_set):
+    """Degree-normalized HP-neighbor heuristic — upper bound for 'trivial' topology."""
+    deg = dict(G.degree())
+    scores = np.array([
+        sum(1 for nb in G.neighbors(n) if nb in hp_set) / max(np.sqrt(deg[n]), 1.0)
+        for n in nodes], np.float32)
+    if scores.max() > 0:
+        scores = (scores - scores.min()) / (scores.max() - scores.min())
+    return scores
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ENGINEERED FEATURES (MMSE-BC locked-feature pipeline)
+# ═══════════════════════════════════════════════════════════════════════
+
+def max_cosim(E, tgt, seeds):
+    """Max cosine similarity to the seed set, leave-self-out masked."""
+    T, S = E[np.asarray(tgt)], E[np.asarray(seeds)]
+    sim = (T @ S.T).astype(np.float32)
+    eq = np.asarray(tgt)[:, None] == np.asarray(seeds)[None, :]
+    if eq.any():
+        sim = sim.copy(); sim[eq] = np.nan
+    m = np.nanmax(sim, axis=1)
+    return np.where(np.isnan(m), 0.0, m).astype(np.float32)
+
+
+def assemble_X(feat_keys, mods, omics, log_deg, tgt, seeds, rwr_arr, m2_arr=None):
+    tgt = np.asarray(tgt); cols = []
+    for k in feat_keys:
+        if k == "max_seq":
+            cols.append(max_cosim(mods["seq"], tgt.tolist(), seeds))
+        elif k == "max_struct":
+            cols.append(max_cosim(mods["struct"], tgt.tolist(), seeds))
+        elif k == "max_go":
+            cols.append(max_cosim(mods["go"], tgt.tolist(), seeds))
+        elif k == "rwr":
+            cols.append(rwr_arr[tgt])
+        elif k == "markov2":
+            cols.append(m2_arr[tgt] if m2_arr is not None else np.zeros(len(tgt), np.float32))
+        elif k == "log_deg":
+            cols.append(log_deg[tgt])
+        elif k in ("mut", "cna", "expr"):
+            cols.append(omics[k][tgt])
+    return np.column_stack(cols).astype(np.float32)
+
+
+def run_mmse_bc_lr(data, locked_feats):
+    """MMSE-BC: logistic regression on the locked engineered feature set."""
+    print(f"\n── MMSE-BC LR (locked: {locked_feats}) ─────────────────")
+    N, W = data["N"], data["W"]
+    hp_train = data["hp_train"]
+    hp_test, neg_test = data["hp_test"], data["neg_test"]
+    all_hp = set(hp_train.tolist()) | set(hp_test.tolist())
+    bg_pool = np.array([i for i in range(N) if i not in all_hp
+                         and i not in set(neg_test.tolist())], np.int64)
+
+    rng = np.random.default_rng(CFG["BASE_SEED"])
+    n_neg = min(len(hp_train) * CFG["NEG_RATIO"], len(bg_pool))
+    neg = rng.choice(bg_pool, n_neg, replace=False)
+    pool = np.concatenate([hp_train, neg])
+    y_pool = np.array([1] * len(hp_train) + [0] * len(neg), np.int32)
+
+    si = hp_train.tolist()
+    rwr_arr = rwr_fn(W, N, si)
+    m2_arr = markov2_fn(W, N, si) if "markov2" in locked_feats else None
+
+    X_pool = assemble_X(locked_feats, data["mods"], data["omics"], data["log_deg"],
+                         pool.tolist(), si, rwr_arr, m2_arr)
+    X_all = assemble_X(locked_feats, data["mods"], data["omics"], data["log_deg"],
+                        list(range(N)), si, rwr_arr, m2_arr)
+    scaler = StandardScaler().fit(X_pool)
+    clf = LogisticRegression(class_weight="balanced", max_iter=2000,
+                              C=1.0, random_state=CFG["BASE_SEED"])
+    clf.fit(scaler.transform(X_pool), y_pool)
+    scores = clf.predict_proba(scaler.transform(X_all))[:, 1].astype(np.float32)
+
+    coef_str = ", ".join(f"{k}={v:+.3f}" for k, v in zip(locked_feats, clf.coef_[0]))
+    print(f"  coef: {coef_str}")
+    return scores
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def fmax_score(y, p):
+    pr, rc, _ = precision_recall_curve(y, p)
+    return float((2 * pr * rc / (pr + rc + 1e-9)).max())
+
+
+def evaluate(scores, y_test, test_idx, method):
+    labels = (y_test[test_idx] == 1.0).astype(int)
+    probs = scores[test_idx]
+    if labels.sum() < 1 or (labels == 0).sum() < 1:
+        return dict(method=method, test_aupr=np.nan, test_auroc=np.nan, fmax=np.nan)
+    return dict(method=method,
+                test_aupr=round(average_precision_score(labels, probs), 4),
+                test_auroc=round(roc_auc_score(labels, probs), 4),
+                fmax=round(fmax_score(labels, probs), 4))
+
+
+def bootstrap_ci_aupr(y, p, rng, n=500):
+    vals = []
+    for _ in range(n):
+        ix = rng.integers(0, len(y), len(y))
+        if y[ix].sum() >= 1 and (y[ix] == 0).sum() >= 1:
+            vals.append(average_precision_score(y[ix], p[ix]))
+    return tuple(np.percentile(vals, [2.5, 97.5]))
+
+
+def delong_auroc(y, sa, sb):
+    """De Long (1988) paired AUROC test — valid for AUROC only, not AUPR."""
+    pm, nm = y == 1, y == 0
+    spa, sna, spb, snb = sa[pm], sa[nm], sb[pm], sb[nm]
+    m, n = len(spa), len(sna)
+    if m == 0 or n == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    def place(sp, sn):
+        m_, n_ = len(sp), len(sn)
+        v10 = np.array([((sn < s).sum() + 0.5 * (sn == s).sum()) / n_ for s in sp])
+        v01 = np.array([((sp > s).sum() + 0.5 * (sp == s).sum()) / m_ for s in sn])
+        return v10, v01
+
+    auc_a, auc_b = roc_auc_score(y, sa), roc_auc_score(y, sb)
+    v10a, v01a = place(spa, sna); v10b, v01b = place(spb, snb)
+    s10aa, s01aa = np.var(v10a, ddof=1) / m, np.var(v01a, ddof=1) / n
+    s10bb, s01bb = np.var(v10b, ddof=1) / m, np.var(v01b, ddof=1) / n
+    s10ab = np.cov(v10a, v10b, ddof=1)[0, 1] / m
+    s01ab = np.cov(v01a, v01b, ddof=1)[0, 1] / n
+    vd = (s10aa + s01aa) + (s10bb + s01bb) - 2 * (s10ab + s01ab)
+    if vd <= 0:
+        return auc_a, auc_b, 0.0, 1.0
+    z = (auc_a - auc_b) / np.sqrt(vd)
+    return auc_a, auc_b, z, float(2 * (1 - norm.cdf(abs(z))))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PUBLISHED LEARNED BASELINES — N2V+XGB, RF feature-only
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_n2v_xgb(data):
+    """Node2Vec embeddings + XGBoost — ablates the GNN (same embeddings, no message passing)."""
+    if not _HAS_XGB:
+        print("\n── N2V+XGB — SKIPPED (xgboost not installed)")
+        return None
+    print("\n── N2V + XGBoost ─────────────────────────────────────────")
+    X, y_bin = data["X_n2v"], (data["y"] == 1.0).astype(int)
+    train_idx = data["train_idx"]
+    n_pos = int(y_bin[train_idx].sum()); n_neg = len(train_idx) - n_pos
+
+    all_scores = []
+    for rep in range(CFG["n_repeats"]):
+        try:
+            tr_sub, val_sub = train_test_split(train_idx, test_size=0.15,
+                                                stratify=y_bin[train_idx], random_state=rep)
+        except ValueError:
+            tr_sub, val_sub = train_test_split(train_idx, test_size=0.15, random_state=rep)
+        model = xgb.XGBClassifier(
+            n_estimators=500, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+            scale_pos_weight=n_neg / max(n_pos, 1), eval_metric="aucpr",
+            early_stopping_rounds=20, random_state=rep, n_jobs=4)
+        model.fit(X[tr_sub], y_bin[tr_sub], eval_set=[(X[val_sub], y_bin[val_sub])], verbose=False)
+        all_scores.append(model.predict_proba(X)[:, 1].astype(np.float32))
+
+    mean_scores = np.mean(np.stack(all_scores), axis=0)
+    result = evaluate(mean_scores, data["y_test"], data["test_idx"], "N2V_XGB")
+    print(f"  AUPR={result['test_aupr']:.4f}  AUROC={result['test_auroc']:.4f}  Fmax={result['fmax']:.4f}")
+    return result, mean_scores
+
+
+def run_rf_feat_only(data):
+    """Random Forest on struct+GO features only — ablates graph topology entirely."""
+    print("\n── RF Feature-Only (no graph) ──────────────────────────────")
+    X = np.hstack([data["mods"].get("struct", np.zeros((data["N"], 1))),
+                    data["mods"].get("go", np.zeros((data["N"], 1)))])
+    y_bin, train_idx = (data["y"] == 1.0).astype(int), data["train_idx"]
+
+    all_scores = []
+    for rep in range(CFG["n_repeats"]):
+        model = RandomForestClassifier(n_estimators=500, min_samples_leaf=2,
+                                        class_weight="balanced", n_jobs=4, random_state=rep)
+        model.fit(X[train_idx], y_bin[train_idx])
+        all_scores.append(model.predict_proba(X)[:, 1].astype(np.float32))
+
+    mean_scores = np.mean(np.stack(all_scores), axis=0)
+    result = evaluate(mean_scores, data["y_test"], data["test_idx"], "RF_FeatOnly")
+    print(f"  AUPR={result['test_aupr']:.4f}  AUROC={result['test_auroc']:.4f}  Fmax={result['fmax']:.4f}")
+    return result, mean_scores
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GNNs — EMOGI-style GCN, CancerGATE-style GAT (shared training loop)
+# ═══════════════════════════════════════════════════════════════════════
+
+class GCNModel(nn.Module):
+    """EMOGI-style 2-layer GCN. PyG GCNConv (self-loops, symmetric norm) or linear fallback."""
+    def __init__(self, in_d, hidden=128, dropout=CFG["dropout"]):
+        super().__init__()
+        self.drop = nn.Dropout(dropout)
+        if _HAS_PYG:
+            self.c1 = GCNConv(in_d, hidden, add_self_loops=True, normalize=True)
+            self.c2 = GCNConv(hidden, hidden // 2, add_self_loops=True, normalize=True)
+            self.head = nn.Linear(hidden // 2, 1)
+        else:
+            self.head = nn.Linear(in_d, 1)   # no-graph fallback
+
+    def forward(self, x, edge_index):
+        if not _HAS_PYG:
+            return self.head(x).squeeze(-1)
+        h = self.drop(F.relu(self.c1(x, edge_index)))
+        h = self.drop(F.relu(self.c2(h, edge_index)))
+        return self.head(h).squeeze(-1)
+
+
+class GATModel(nn.Module):
+    """CancerGATE-style 2-layer GAT. PyG GATConv (8 heads → 1 head) or linear fallback."""
+    def __init__(self, in_d, hidden=64, heads=8, dropout=CFG["dropout"]):
+        super().__init__()
+        self.drop = nn.Dropout(dropout)
+        if _HAS_PYG:
+            self.g1 = GATConv(in_d, hidden, heads=heads, dropout=dropout, add_self_loops=True)
+            self.g2 = GATConv(hidden * heads, hidden, heads=1, concat=False,
+                               dropout=dropout, add_self_loops=True)
+            self.head = nn.Linear(hidden, 1)
+        else:
+            self.head = nn.Linear(in_d, 1)
+
+    def forward(self, x, edge_index):
+        if not _HAS_PYG:
+            return self.head(x).squeeze(-1)
+        h = self.drop(F.elu(self.g1(x, edge_index)))
+        h = self.drop(F.elu(self.g2(h, edge_index)))
+        return self.head(h).squeeze(-1)
+
+
+def train_gnn(model, X_t, y_t, train_idx_t, val_idx_t, edge_index,
+              epochs=CFG["epochs"], patience=CFG["patience"], lr=CFG["lr"], weight_decay=5e-4):
+    """Full-graph transductive training with early stopping on val AUPR. No test leakage."""
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.05)
+    n_pos = int((y_t[train_idx_t] == 1.0).sum().item())
+    n_neg = int((y_t[train_idx_t] == 0.0).sum().item())
+    pw = torch.tensor([n_neg / max(n_pos, 1)], device=DEVICE)
+
+    val_labels = (y_t[val_idx_t].cpu().numpy() == 1.0).astype(float)
+    best_aupr, best_wts, counter = 0.0, None, 0
+
+    for ep in range(epochs):
+        model.train(); opt.zero_grad()
+        logits = model(X_t, edge_index)
+        loss = F.binary_cross_entropy_with_logits(logits[train_idx_t], y_t[train_idx_t], pos_weight=pw)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step(); sched.step()
+
+        if (ep + 1) % 5 == 0 and len(val_labels) > 0:
+            model.eval()
+            with torch.no_grad():
+                vp = torch.sigmoid(model(X_t, edge_index)[val_idx_t]).cpu().numpy()
+            if val_labels.sum() >= 1 and (val_labels == 0).sum() >= 1:
+                va = average_precision_score(val_labels, vp)
+                if va > best_aupr:
+                    best_aupr, counter = va, 0
+                    best_wts = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                else:
+                    counter += 5
+            if counter >= patience:
+                break
+
+    if best_wts:
+        model.load_state_dict(best_wts)
+    model.eval()
+    return model
+
+
+def run_gnn_method(model_cls, name, X, edge_index, data, reps=CFG["n_repeats"], lr=CFG["lr"]):
+    """Repeated-fit GNN runner. Each rep gets an independent train/val split (no test leakage)."""
+    print(f"\n── {name} ────────────────────────────────────────────────")
+    X_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+    y_t = torch.tensor(data["y"], device=DEVICE)
+    ei = edge_index.to(DEVICE)
+    train_idx, y_bin = data["train_idx"], (data["y"] == 1.0).astype(int)
+
+    all_scores = []
+    for rep in range(reps):
+        try:
+            tr_sub, val_sub = train_test_split(train_idx, test_size=0.10,
+                                                stratify=y_bin[train_idx], random_state=42 + rep)
+        except ValueError:
+            tr_sub, val_sub = train_test_split(train_idx, test_size=0.10, random_state=42 + rep)
+        tr_t = torch.tensor(tr_sub, dtype=torch.long, device=DEVICE)
+        val_t = torch.tensor(val_sub, dtype=torch.long, device=DEVICE)
+
+        model = model_cls(X.shape[1]).to(DEVICE)
+        train_gnn(model, X_t, y_t, tr_t, val_t, ei, lr=lr)
+        with torch.no_grad():
+            all_scores.append(torch.sigmoid(model(X_t, ei)).cpu().numpy().astype(np.float32))
+        del model; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    mean_scores = np.mean(np.stack(all_scores), axis=0)
+    result = evaluate(mean_scores, data["y_test"], data["test_idx"], name)
+    print(f"  AUPR={result['test_aupr']:.4f}  AUROC={result['test_auroc']:.4f}  "
+          f"Fmax={result['fmax']:.4f}  (mean of {reps} reps)")
+    return result, mean_scores
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ONCOPLEX-style HGNN (Alotaibi et al. 2026 — current SOTA, supervised)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _load_pathway_hyperedges(nodes, cache_dir):
+    """Build incidence matrix H (N_genes × N_pathways) from MSigDB, cached.
+    Falls back to degree-quintile grouping if MSigDB is unavailable."""
+    cache_h = os.path.join(cache_dir, "hyperedge_H.npy")
+    if os.path.exists(cache_h):
+        H = np.load(cache_h)
+        print(f"  📦 Hyperedge matrix from cache: {H.shape}")
+        return H
+
+    node_set = {str(n) for n in nodes}
+    node2idx = {str(n): i for i, n in enumerate(nodes)}
+    pathways = {}
+    try:
+        import gseapy as gp
+        for lib in ["MSigDB_Hallmark_2020", "KEGG_2021_Human", "Reactome_2022"]:
+            try:
+                for pw_name, gene_list in gp.get_library(name=lib, organism="Human").items():
+                    pathways[f"{lib}__{pw_name}"] = set(gene_list)
+            except Exception:
+                pass
+    except ImportError:
+        print("  [HGNN] gseapy not available — using fallback degree-quintile groups")
+
+    if len(pathways) < 10:
+        try:
+            G_tmp = nx.read_gml(CFG["gml_path"])
+            deg_arr = np.array([dict(G_tmp.degree()).get(n, 0) for n in nodes])
+            for q in range(20):
+                lo, hi = np.percentile(deg_arr, q * 5), np.percentile(deg_arr, (q + 1) * 5)
+                members = {str(nodes[i]) for i in range(len(nodes)) if lo <= deg_arr[i] <= hi}
+                if members:
+                    pathways[f"DegGroup_{q}"] = members
+        except Exception as e:
+            print(f"  [HGNN] Fallback failed: {e}")
+
+    pw_valid = [(name, g & node_set) for name, g in pathways.items() if 3 <= len(g & node_set) <= 500]
+    if not pw_valid:
+        pw_valid = [(f"Gene_{i}", {str(nodes[i])}) for i in range(min(len(nodes), 200))]
+
+    P = len(pw_valid)
+    H = np.zeros((len(nodes), P), dtype=np.float32)
+    for j, (_, genes) in enumerate(pw_valid):
+        for g in genes:
+            if g in node2idx:
+                H[node2idx[g], j] = 1.0
+    np.save(cache_h, H)
+    print(f"  [HGNN] {P} valid pathways, H={H.shape}  nnz={int(H.sum()):,}")
+    return H
+
+
+class HGNNLayer(nn.Module):
+    """X' = D_v^{-1} H W D_e^{-1} H^T X Θ  (Feng et al. 2019, AAAI)."""
+    def __init__(self, in_d, out_d, dropout=0.5):
+        super().__init__()
+        self.theta = nn.Linear(in_d, out_d, bias=False)
+        self.bn = nn.BatchNorm1d(out_d)
+        self.drop = nn.Dropout(dropout)
+        nn.init.xavier_uniform_(self.theta.weight)
+
+    def forward(self, x, H, D_v_inv, W_D_e_inv):
+        Tx = self.theta(x)
+        out = D_v_inv.unsqueeze(1) * (H @ (W_D_e_inv.unsqueeze(1) * (H.t() @ Tx)))
+        return self.drop(F.elu(self.bn(out)))
+
+
+class ONCOPLEX_HGNN(nn.Module):
+    def __init__(self, in_d, hidden=256, dropout=0.5):
+        super().__init__()
+        self.hgnn1 = HGNNLayer(in_d, hidden, dropout)
+        self.hgnn2 = HGNNLayer(hidden, hidden // 2, dropout)
+        self.head = nn.Sequential(nn.Linear(hidden // 2, hidden // 4), nn.ELU(),
+                                   nn.Dropout(dropout), nn.Linear(hidden // 4, 1))
+
+    def forward(self, x, H, D_v_inv, W_D_e_inv):
+        h = self.hgnn1(x, H, D_v_inv, W_D_e_inv)
+        h = self.hgnn2(h, H, D_v_inv, W_D_e_inv)
+        return self.head(h).squeeze(-1)
+
+
+def run_oncoplex(data):
+    """
+    Supervised HGNN baseline (current SOTA, Jan 2026). Uses confirmed negatives
+    as hard labels — strictly easier setup than MMSE-BC's PU learning, noted
+    for fairness rather than hidden.
+    """
+    print("\n── ONCOPLEX-style HGNN (Alotaibi et al. 2026) ───────────────")
+    print("   ⚠  Supervised (uses confirmed negatives) — MMSE-BC is PU learning, no negatives")
+
+    H_np = _load_pathway_hyperedges(data["nodes"], CFG["ppi_cache"])
+    H = torch.tensor(H_np, dtype=torch.float32, device=DEVICE)
+    d_v = H.sum(dim=1).clamp(min=1.0); D_v_inv = 1.0 / d_v
+    d_e = H.sum(dim=0).clamp(min=1.0); W_D_e_inv = 1.0 / (d_e * d_e)
+
+    X_t = torch.tensor(data["X_full"], device=DEVICE)
+    y_sup = np.zeros(data["N"], np.float32)
+    y_sup[data["hp_train"]] = 1.0
+    y_sup[data["neg_train"]] = 0.0
+    y_t = torch.tensor(y_sup, device=DEVICE)
+    train_idx, test_idx, y_test = data["train_idx"], data["test_idx"], data["y_test"]
+    y_bin_tr = (y_sup[train_idx] == 1).astype(int)
+    n_pos, n_neg = int(y_bin_tr.sum()), len(train_idx) - int(y_bin_tr.sum())
+
+    all_scores = []
+    for rep in range(CFG["n_repeats"]):
+        try:
+            tr_sub, val_sub = train_test_split(train_idx, test_size=0.10,
+                                                stratify=y_bin_tr, random_state=42 + rep)
+        except ValueError:
+            tr_sub, val_sub = train_test_split(train_idx, test_size=0.10, random_state=42 + rep)
+        tr_t = torch.tensor(tr_sub, dtype=torch.long, device=DEVICE)
+        val_t = torch.tensor(val_sub, dtype=torch.long, device=DEVICE)
+        pw = torch.tensor([n_neg / max(n_pos, 1)], device=DEVICE)
+
+        model = ONCOPLEX_HGNN(X_t.shape[1]).to(DEVICE)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG["epochs"], eta_min=1e-5)
+        val_labels = (y_sup[val_sub] == 1.0).astype(float)
+        best_aupr, best_wts, counter = 0.0, {}, 0
+
+        for ep in range(CFG["epochs"]):
+            model.train(); opt.zero_grad()
+            logits = model(X_t, H, D_v_inv, W_D_e_inv)
+            loss = F.binary_cross_entropy_with_logits(logits[tr_t], y_t[tr_t], pos_weight=pw)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); sched.step()
+
+            if (ep + 1) % 5 == 0:
+                model.eval()
+                with torch.no_grad():
+                    vp = torch.sigmoid(model(X_t, H, D_v_inv, W_D_e_inv)[val_t]).cpu().numpy()
+                if val_labels.sum() >= 1 and (val_labels == 0).sum() >= 1:
+                    va = average_precision_score(val_labels, vp)
+                    if va > best_aupr:
+                        best_aupr, counter = va, 0
+                        best_wts = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    else:
+                        counter += 5
+                if counter >= CFG["patience"]:
+                    break
+
+        if best_wts:
+            model.load_state_dict(best_wts)
+        model.eval()
+        with torch.no_grad():
+            all_scores.append(torch.sigmoid(model(X_t, H, D_v_inv, W_D_e_inv)).cpu().numpy().astype(np.float32))
+        del model; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    mean_scores = np.mean(np.stack(all_scores), axis=0)
+    result = evaluate(mean_scores, y_test, test_idx, "ONCOPLEX_HGNN")
+    print(f"  AUPR={result['test_aupr']:.4f}  AUROC={result['test_auroc']:.4f}  "
+          f"Fmax={result['fmax']:.4f}  (mean of {len(all_scores)} reps)")
+    return result, mean_scores
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    t0 = time.time()
+    print(f"\n{'=' * 78}\n  MMSE-BC Full Benchmark — classical, engineered, and learned baselines\n{'=' * 78}")
+
+    # Locked feature config: read from prior ablation step if available
+    if os.path.exists(CFG["ablation_json"]):
+        with open(CFG["ablation_json"]) as f:
+            ab = json.load(f)
+        winner = ab["winner"]
+        locked_feats = ab["networks"][winner]["abl_stats"].get("locked_feats", DEFAULT_LOCKED_FEATS)
+        print(f"  Loaded locked config from {CFG['ablation_json']}: winner={winner}")
+    else:
+        locked_feats = DEFAULT_LOCKED_FEATS
+        print(f"  No ablation_detail.json found — using default locked feats: {locked_feats}")
+
+    data = load_data()
+    y_test, test_idx = data["y_test"], data["test_idx"]
+    N, A, W, G, nodes = data["N"], data["A"], data["W"], data["G"], data["nodes"]
+    hp_train_set = set(data["hp_train"].tolist())
+
+    all_results, all_scores = [], {}
+
+    # ── Classical topology baselines ────────────────────────────────
+    rwr_scores = rwr_fn(W, N, data["hp_train"].tolist())
+    m2_scores = markov2_fn(W, N, data["hp_train"].tolist())
+    classical = {
+        "RWR":        rwr_scores,
+        "Markov-2":   m2_scores,
+        "MV":         mv_scores_fn(A, N, hp_train_set),
+        "Hishigaki":  hishigaki_fn(A, N, hp_train_set),
+        "NIAPU":      niapu_fn(W, A, N, hp_train_set),
+        "LocalNbr":   local_nbr_fn(G, nodes, hp_train_set),
+    }
+    for name, sc in classical.items():
+        r = evaluate(sc.astype(np.float64), y_test, test_idx, name)
+        all_results.append(r); all_scores[name] = sc
+        print(f"  {name:<12} AUPR={r['test_aupr']:.4f}  AUROC={r['test_auroc']:.4f}  Fmax={r['fmax']:.4f}")
+
+    # ── MMSE-BC LR (engineered, locked features) ────────────────────
+    mmse_scores = run_mmse_bc_lr(data, locked_feats)
+    mmse_result = evaluate(mmse_scores, y_test, test_idx, "MMSE-BC ★")
+    all_results.append(mmse_result); all_scores["MMSE-BC ★"] = mmse_scores
+    print(f"  AUPR={mmse_result['test_aupr']:.4f}  AUROC={mmse_result['test_auroc']:.4f}  Fmax={mmse_result['fmax']:.4f}")
+
+    # ── Published learned baselines ──────────────────────────────────
+    for fn in (run_n2v_xgb, run_rf_feat_only, run_oncoplex):
+        try:
+            out = fn(data)
+            if out:
+                r, sc = out
+                all_results.append(r); all_scores[r["method"]] = sc
+        except Exception as e:
+            import traceback; print(f"  ⚠  {fn.__name__} FAILED: {e}"); traceback.print_exc()
+
+    # ── GCN / GAT — locked engineered features vs full 262-d PPI stack ─
+    si = data["hp_train"].tolist()
+    rwr_arr, m2_arr = rwr_fn(W, N, si), markov2_fn(W, N, si)
+    X_locked = assemble_X(locked_feats, data["mods"], data["omics"], data["log_deg"],
+                           list(range(N)), si, rwr_arr, m2_arr)
+    X_locked_s = StandardScaler().fit(X_locked[data["train_idx"]]).transform(X_locked).astype(np.float32)
+
+    for model_cls, tag in [(GCNModel, "GCN"), (GATModel, "GAT")]:
+        try:
+            r, sc = run_gnn_method(model_cls, f"{tag} [{len(locked_feats)}feat-locked]",
+                                    X_locked_s, data["edge_index"], data)
+            all_results.append(r); all_scores[r["method"]] = sc
+        except Exception as e:
+            import traceback; print(f"  ⚠  {tag} (locked) FAILED: {e}"); traceback.print_exc()
+
+    try:
+        r, sc = run_gnn_method(GCNModel, f"GCN [{data['X_full'].shape[1]}feat-full]",
+                                data["X_full"], data["edge_index"], data)
+        all_results.append(r); all_scores[r["method"]] = sc
+    except Exception as e:
+        import traceback; print(f"  ⚠  GCN (full) FAILED: {e}"); traceback.print_exc()
+
+    # ── Comparison table: bootstrap CI + De Long vs MMSE-BC ──────────
+    print(f"\n{'=' * 86}\n  FULL BENCHMARK — locked features: {locked_feats}\n"
+          f"  AUPR: bootstrap 95% CI | AUROC: De Long (valid for AUROC only)\n{'=' * 86}")
+    print(f"  {'Method':<26} {'AUPR':>7} {'AUPR 95% CI':>16} {'AUROC':>7} {'Fmax':>6}")
+    print("  " + "─" * 70)
+
+    rng_boot = np.random.default_rng(CFG["BASE_SEED"])
+    labels = (y_test[test_idx] == 1.0).astype(int)
+    ci_table, mmse_lo, mmse_hi = {}, 0.0, 0.0
+    p_mmse = mmse_scores[test_idx].astype(np.float64)
+
+    for r in all_results:
+        name = r["method"]
+        if name not in all_scores or np.isnan(r["test_aupr"]):
+            print(f"  {name:<26} {'—':>7} {'—':>16} {'—':>7} {'—':>6}")
+            continue
+        p = all_scores[name][test_idx].astype(np.float64)
+        lo, hi = bootstrap_ci_aupr(labels, p, rng_boot, n=500)
+        ci_table[name] = (lo, hi)
+        if "★" in name:
+            mmse_lo, mmse_hi = lo, hi
+        print(f"  {name:<26} {r['test_aupr']:>7.4f} [{lo:.3f},{hi:.3f}] "
+              f"{r['test_auroc']:>7.4f} {r['fmax']:>6.4f}")
+
+    print(f"\n  vs. MMSE-BC [{mmse_lo:.3f},{mmse_hi:.3f}]:")
+    for r in all_results:
+        name = r["method"]
+        if "★" in name or name not in ci_table:
+            continue
+        lo, hi = ci_table[name]
+        ov = lo < mmse_hi and hi > mmse_lo
+        p = all_scores[name][test_idx].astype(np.float64)
+        _, _, _, pd_ = delong_auroc(labels, p_mmse, p)
+        print(f"    {name:<26} AUPR-CI: {'overlap' if ov else 'NON-overlap':<12} AUROC De Long p={pd_:.4f}")
+
+    # ── Save results ──────────────────────────────────────────────
+    df = pd.DataFrame(all_results)
+    df.to_csv(os.path.join(CFG["out_dir"], "full_benchmark_results.csv"), index=False)
+    with open(os.path.join(CFG["out_dir"], "full_benchmark_config.json"), "w") as f:
+        json.dump({"locked_feats": locked_feats,
+                    "runtime_min": round((time.time() - t0) / 60, 1)}, f, indent=2)
+
+    print(f"\n  Saved → {CFG['out_dir']}full_benchmark_results.csv")
+    print(f"  Saved → {CFG['out_dir']}full_benchmark_config.json")
+    print(f"  Runtime: {round((time.time() - t0) / 60, 1)} min")
+    return df
+
+
+if __name__ == "__main__":
+    main()
