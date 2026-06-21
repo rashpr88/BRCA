@@ -1,0 +1,202 @@
+"""
+DEGs for validation
+"""
+BASE      = "/content/drive/MyDrive/MMSE BC/"
+UNION_GML = BASE + "multi_network/string_union_cpdb.gml"
+H5_PATH   = BASE + "Copy of node_embeddings_filtered_new4.h5"
+BENCH     = BASE + "benchmark.py"
+OMICS_CSV = BASE + "stage3/stage3c_omics_features.csv"
+OUT_DIR   = BASE + "multi_network/"
+DEPS_CSV  = OUT_DIR + "brca_deps.csv"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ── Updated file paths ────────────────────────────────────────────────
+# STAR FPKM merged matrix from Xena (raw FPKM, NOT log-transformed)
+EXPR_LOCAL  = BASE + "TCGA-BRCA.star_fpkm.tsv.gz"
+PHENO_LOCAL = BASE + "TCGA-BRCA.clinical.tsv.gz"
+
+def download_if_missing(url, local_path):
+    if not os.path.exists(local_path):
+        print(f"  Downloading {os.path.basename(local_path)}...")
+        urllib.request.urlretrieve(url, local_path)
+    else:
+        print(f"  Found cached: {os.path.basename(local_path)}")
+
+
+# PART 1 — COMPUTE BRCA DEGs FROM TCGA STAR EXPRESSION
+
+
+print("\n[DEP-1] Using manually downloaded TCGA-BRCA STAR FPKM files...")
+print(f"  Expression : {EXPR_LOCAL}")
+print(f"  Phenotype  : {PHENO_LOCAL}")
+
+# ─── 1B. Load phenotype ───────────────────────────────────────────────
+print("\n[DEP-2] Loading sample phenotypes...")
+pheno = pd.read_csv(PHENO_LOCAL, sep="\t", compression="gzip", low_memory=False)
+print(f"  Phenotype rows: {len(pheno)}")
+print(f"  Columns sample: {list(pheno.columns[:8])}")
+
+# Identify sample ID column — Xena phenotype uses 'submitter_id.samples' or 'sampleID'
+id_col = next((c for c in ["submitter_id.samples", "sampleID", "sample", "bcr_sample_barcode"]
+               if c in pheno.columns), pheno.columns[0])
+print(f"  Using sample ID column: '{id_col}'")
+
+# sample_type: "Primary Tumor" vs "Solid Tissue Normal"
+type_col = next((c for c in ["sample_type.samples", "sample_type", "_sample_type"]
+                 if c in pheno.columns), None)
+if type_col is None:
+    raise ValueError(f"Cannot find sample_type column. Available: {list(pheno.columns)}")
+print(f"  Using sample type column: '{type_col}'")
+
+print(f"  Sample type counts:\n{pheno[type_col].value_counts().to_string()}")
+
+tumor_ids  = set(pheno.loc[pheno[type_col].str.contains("Primary Tumor",  na=False), id_col])
+normal_ids = set(pheno.loc[pheno[type_col].str.contains("Solid Tissue Normal", na=False), id_col])
+print(f"  Tumor IDs:  {len(tumor_ids)}")
+print(f"  Normal IDs: {len(normal_ids)}")
+
+# ─── 1C. Load STAR FPKM matrix ───────────────────────────────────────
+print("\n[DEP-3] Loading STAR FPKM expression matrix (1-2 min)...")
+expr = pd.read_csv(EXPR_LOCAL, sep="\t", compression="gzip", index_col=0)
+print(f"  Raw matrix: {expr.shape[0]} genes × {expr.shape[1]} samples")
+print(f"  Index sample (first 3): {list(expr.index[:3])}")
+print(f"  Column sample (first 3): {list(expr.columns[:3])}")
+
+# Xena STAR FPKM: rows = Ensembl IDs (may have version), cols = TCGA barcodes
+# Strip Ensembl version suffix if present (e.g. ENSG00000000003.15 → ENSG00000000003)
+expr.index = expr.index.str.split(".").str[0]
+
+# # ── Log2(FPKM + 1) transform ─────────────────────────────────────────
+# # STAR FPKM from Xena is raw FPKM (unlike HTSeq-FPKM which was pre-log2)
+# print("  Applying log2(FPKM + 1) transform...")
+# expr = np.log2(expr + 1)
+
+# ─── 1C-ii. Map Ensembl → HGNC using MyGene.info API ─────────────────
+# Replaces the broken GDC S3 probeMap download
+import requests
+
+print("  Fetching Ensembl→symbol map from MyGene.info...")
+
+# Strip version from index first
+expr.index = expr.index.str.split(".").str[0]
+ensg_ids = expr.index.tolist()
+
+# Query in batches of 1000
+def fetch_mygene_batch(ids):
+    url = "https://mygene.info/v3/gene"
+    payload = {
+        "ids":    ",".join(ids),
+        "fields": "symbol",
+        "species": "human",
+    }
+    r = requests.post(url, data=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+ensg_to_symbol = {}
+BATCH = 1000
+for start in range(0, len(ensg_ids), BATCH):
+    batch = ensg_ids[start:start + BATCH]
+    try:
+        results = fetch_mygene_batch(batch)
+        for item in results:
+            if "notfound" not in item and "symbol" in item:
+                ensg_to_symbol[item["query"]] = item["symbol"]
+    except Exception as e:
+        print(f"  Warning: batch {start}-{start+BATCH} failed: {e}")
+    if (start // BATCH + 1) % 5 == 0:
+        print(f"    Mapped {start+BATCH}/{len(ensg_ids)} genes...")
+
+print(f"  Gene map entries: {len(ensg_to_symbol)}")
+
+expr["symbol"] = expr.index.map(ensg_to_symbol)
+expr = expr.dropna(subset=["symbol"])
+expr["mean_expr"] = expr.drop(columns=["symbol"]).mean(axis=1)
+expr = expr.sort_values("mean_expr", ascending=False).drop_duplicates("symbol")
+expr = expr.set_index("symbol").drop(columns=["mean_expr"])
+print(f"  Genes after HGNC mapping + dedup: {expr.shape[0]}")
+
+# ─── 1C-iii. Match sample barcodes ───────────────────────────────────
+# Debug: print exact format of both ID sets
+print(f"  Expr col example:   '{list(expr.columns[:3])}'")
+print(f"  Tumor ID example:   '{list(tumor_ids)[:3]}'")
+print(f"  Normal ID example:  '{list(normal_ids)[:3]}'")
+
+# Build a mapping from truncated (15-char) expr columns → full expr column names
+# Xena STAR cols: TCGA-D8-A146-01A (16 chars)
+# Pheno sample:   TCGA-D8-A146-01  (15 chars) ← likely missing the letter suffix
+expr_col_map = {col[:15]: col for col in expr.columns}  # 15-char → full col name
+
+# Match tumor/normal IDs (15-char from pheno) to expr columns
+t_present  = [expr_col_map[s[:15]] for s in tumor_ids  if s[:15] in expr_col_map]
+n_present  = [expr_col_map[s[:15]] for s in normal_ids if s[:15] in expr_col_map]
+
+# Deduplicate
+t_present = list(dict.fromkeys(t_present))
+n_present = list(dict.fromkeys(n_present))
+
+print(f"  Tumor samples matched:  {len(t_present)}")
+print(f"  Normal samples matched: {len(n_present)}")
+
+if len(n_present) < 5:
+    # Extra debug if still failing
+    pheno_ex = list(tumor_ids)[:2]
+    expr_ex  = list(expr.columns[:2])
+    raise ValueError(
+        f"Still no match. Check formats:\n"
+        f"  Pheno: {pheno_ex} (len={len(pheno_ex[0])})\n"
+        f"  Expr:  {expr_ex}  (len={len(expr_ex[0])})"
+    )
+# ─── 1D. Compute DEPs ────────────────────────────────────────────────
+print("\n[DEP-4] Computing differentially expressed genes...")
+T = expr[t_present].values
+N = expr[n_present].values
+
+mean_t = T.mean(axis=1)
+mean_n = N.mean(axis=1)
+log2fc = mean_t - mean_n  # valid because expr is already log2(FPKM+1)
+
+# Filter zero-variance genes (all-zero rows → ttest returns NaN)
+var_t = T.var(axis=1)
+var_n = N.var(axis=1)
+testable_mask = (var_t > 0) & (var_n > 0)
+print(f"  Testable genes (non-zero variance in both groups): {testable_mask.sum()}")
+print(f"  Skipped (zero variance): {(~testable_mask).sum()}")
+
+# Run t-tests only on testable genes
+pvals = np.full(expr.shape[0], np.nan)
+testable_idx = np.where(testable_mask)[0]
+print(f"  Running Welch t-tests for {len(testable_idx)} genes...")
+for k, i in enumerate(testable_idx):
+    _, pvals[i] = ttest_ind(T[i], N[i], equal_var=False, nan_policy="omit")
+    if (k + 1) % 5000 == 0:
+        print(f"    {k+1}/{len(testable_idx)}")
+
+# BH correction only on non-NaN pvals
+valid_mask = ~np.isnan(pvals)
+print(f"  Valid p-values: {valid_mask.sum()}")
+padj = np.full(expr.shape[0], np.nan)
+_, padj[valid_mask], _, _ = multipletests(pvals[valid_mask], method="fdr_bh")
+
+# DEP criterion — 0.5 threshold for already-log2(FPKM+1) data
+FC_THRESH = 0.58
+deps_mask = (np.abs(log2fc) > FC_THRESH) & (padj < 0.05)
+n_deps    = deps_mask.sum()
+print(f"\n  Total DEPs (|log2FC|>{FC_THRESH}, FDR<0.05): {n_deps}")
+print(f"  Up-regulated   (log2FC > +{FC_THRESH}): {((log2fc > FC_THRESH) & (padj < 0.05)).sum()}")
+print(f"  Down-regulated (log2FC < -{FC_THRESH}): {((log2fc < -FC_THRESH) & (padj < 0.05)).sum()}")
+
+dep_df = pd.DataFrame({
+    "gene":     expr.index,
+    "log2FC":   log2fc,
+    "p_value":  pvals,
+    "padj_FDR": padj,
+    "is_DEP":   deps_mask,
+    "direction": np.where(log2fc > 0, "UP", "DOWN"),
+})
+dep_df = dep_df.sort_values("padj_FDR")
+dep_df.to_csv(DEPS_CSV, index=False)
+print(f"\n  Saved → {DEPS_CSV}")
+
+
+
