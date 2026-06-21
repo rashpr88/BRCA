@@ -1,0 +1,348 @@
+
+"""
+Import this module in all three pipeline scripts for consistent
+preprocessing, graph construction, and statistical testing.
+
+Normalisation decisions 
+Embeddings (seq 1024d, struct 512d, go 200d):
+  Step 1 — global z-score standardise across all N=14,043 genes
+            (removes mean-shift between embedding dimensions)
+            label-free: uses all genes, not just HPs
+  Step 2 — L2-normalise per gene → unit hypersphere
+            required for cosine similarity: cos(θ) = u·v when |u|=|v|=1
+  → Output: max cosine similarity to fold-train HPs, scalar in [0,1]
+
+Omics (mut_freq, cna_freq, expr_zscore — scalars):
+  Step 1 — global z-score standardise across all N genes
+            (makes mut [0,0.2], cna [0,0.8], expr [-5,+10] comparable)
+            label-free: gene-level population statistics, no patient data
+  NOTE:  L2-norm is NOT applied to omics — omics are scalar features.
+         L2-norm of scalar x = |x|, so x/|x| = sign(x): destroys magnitude.
+         L2-norm is only meaningful for multi-dimensional vectors.
+
+Graph features (rwr, markov2 — scalars):
+  Computed per fold from fold train-HP seeds only (no leakage)
+  Already bounded [0,1] by normalised adjacency; fold StandardScaler handles
+
+log_degree (scalar):
+  log1p(degree in full PPI graph) — globally computed, deterministic, label-free
+
+Fold-level StandardScaler:
+  Fit on assembled training pool feature matrix ONLY
+  Applied to train pool and validation/test pool
+  Ensures no leakage of test-set statistics into training
+
+Statistical testing decisions
+-----------------------------
+  CV AUPR comparison (across 20 repeats):
+    → paired t-test + Wilcoxon signed-rank (20 paired observations)
+    → valid for continuous metric comparisons across matched folds
+
+  Holdout AUPR comparison (single test set):
+    → bootstrap 95% CI (n=2000 resamples)
+    → two methods differ significantly if CIs do NOT overlap
+    → De Long test is NOT used for AUPR (DeLong 1988 derived for AUROC)
+
+  Holdout AUROC comparison:
+    → De Long (1988) test — valid for AUROC only
+    → operates on placement statistics of the ROC curve
+
+  Fmax comparison:
+    → bootstrap 95% CI (same as AUPR)
+"""
+
+import os, csv
+import numpy as np, networkx as nx, scipy.sparse as sp
+import h5py
+from sklearn.preprocessing import normalize, StandardScaler
+from sklearn.metrics import (average_precision_score, roc_auc_score,
+                             precision_recall_curve)
+from scipy.stats import norm
+
+# GRAPH CONSTRUCTION
+
+def build_clean_adj(gml_path):
+    """
+    Load clean GML and build deduplicated symmetric adjacency.
+    NEVER uses data["A"] — that adjacency contains 67 extra edges.
+    Returns: G (networkx), gml_nodes (list), A (csr), W (row-norm csr), deg
+    """
+    G = nx.read_gml(gml_path)
+    gml_nodes = list(G.nodes())
+    N = len(gml_nodes)
+    n2i = {n: i for i, n in enumerate(gml_nodes)}
+    seen = set(); rs, cs = [], []
+    for u, v in G.edges():
+        if u in n2i and v in n2i:
+            i, j = n2i[u], n2i[v]
+            pair = tuple(sorted([i, j]))
+            if pair not in seen:
+                seen.add(pair); rs += [i, j]; cs += [j, i]
+    A = sp.csr_matrix(([1.0]*len(rs), (rs, cs)), shape=(N, N))
+    d = np.asarray(A.sum(1)).flatten(); d[d == 0] = 1.0
+    W = (sp.diags(1.0/d) @ A).tocsr()
+    deg = np.asarray(A.sum(1)).flatten()
+    return G, gml_nodes, A, W, deg
+
+
+def rwr(W, N, seeds, alpha=0.15, n_iter=50):
+    """Personalised PageRank from seed set. Recompute per fold."""
+    s = np.zeros(N, np.float32); s[seeds] = 1./len(seeds); r = s.copy()
+    for _ in range(n_iter): r = (1-alpha)*(W.T@r) + alpha*s
+    return r
+
+
+def markov2(W, N, seeds):
+    """2-step Markov diffusion from seed set."""
+    s = np.zeros(N, np.float32); s[seeds] = 1./len(seeds)
+    return (W.T @ (W.T @ s)).astype(np.float32)
+
+
+# GLOBAL PREPROCESSING  (label-free, done once)
+
+def load_and_preprocess_embeddings(h5_path, nodes):
+    """
+    Load seq, struct, go embeddings.
+    Apply: global z-score → L2-normalise per gene.
+    Returns dict: modality → (N, d) float32 on unit hypersphere.
+    """
+    mods = {}
+    with h5py.File(h5_path, "r") as f:
+        for key in ["seq", "struct", "go"]:
+            if key not in f: continue
+            s0 = next(iter(f[key].keys()))
+            d  = np.asarray(f[key][s0][()]).flatten().shape[0]
+            M  = np.zeros((len(nodes), d), np.float32)
+            av = set(f[key].keys())
+            for i, n in enumerate(nodes):
+                if str(n) in av:
+                    M[i] = np.asarray(f[key][str(n)][()]).flatten()
+            M = StandardScaler().fit_transform(M).astype(np.float32)  # z-score
+            M = normalize(M, axis=1).astype(np.float32)               # L2-norm
+            mods[key] = M
+    return mods
+
+
+def load_and_preprocess_omics(csv_path, nodes):
+    """
+    Load TCGA-BRCA omics (mut_freq, cna_freq, expr_zscore).
+    Apply: global z-score standardisation (NOT L2-norm — scalars, not vectors).
+    Returns dict: feature_name → (N,) float32 array.
+
+    Why global z-score only (no L2-norm):
+      Omics are scalar features per gene. L2-norm of scalar x = |x|, giving
+      x/|x| = sign(x) which destroys magnitude. L2-norm is appropriate only
+      for multi-dimensional vectors (e.g., protein embeddings for cosine sim).
+      Global z-score aligns the three omics scales before fold StandardScaler.
+    """
+    g2i = {str(n): i for i, n in enumerate(nodes)}
+    raw = {k: np.zeros(len(nodes), np.float32)
+           for k in ["mut", "cna", "expr"]}
+    key_map = {"mut_freq": "mut", "cna_freq": "cna", "expr_zscore": "expr"}
+    if os.path.exists(csv_path):
+        with open(csv_path) as f:
+            for row in csv.DictReader(f):
+                if row["gene"] in g2i:
+                    i = g2i[row["gene"]]
+                    for csv_col, feat_key in key_map.items():
+                        if csv_col in row:
+                            raw[feat_key][i] = float(row[csv_col])
+
+    def global_zscore(x):
+        mu, sd = x.mean(), x.std()
+        return ((x - mu) / max(sd, 1e-9)).astype(np.float32)
+
+    return {k: global_zscore(v) for k, v in raw.items()}
+
+
+def compute_log_degree(deg):
+    """log1p(degree) — globally computed, label-free."""
+    return np.log1p(deg).astype(np.float32)
+
+# PER-FOLD FEATURE ASSEMBLY
+
+def max_cosine_sim(E, tgt_idx, seed_idx):
+    """
+    Max cosine similarity from each target gene to any seed gene.
+    Leave-self-out: if target==seed, masked to NaN.
+    E must be L2-normalised (unit vectors) for cosine sim = dot product.
+    """
+    tgt = np.asarray(tgt_idx); sd = np.asarray(seed_idx)
+    S = (E[tgt] @ E[sd].T).astype(np.float32)
+    eq = tgt[:, None] == sd[None, :]
+    if eq.any(): S = S.copy(); S[eq] = np.nan
+    m = np.nanmax(S, axis=1)
+    return np.where(np.isnan(m), 0.0, m).astype(np.float32)
+
+
+def assemble_features(feat_keys, mods, omics, log_deg,
+                      tgt_idx, seed_idx, rwr_arr, m2_arr=None):
+    """
+    Assemble feature matrix for target genes.
+
+    feat_keys: subset of ["max_seq","max_struct","max_go",
+                          "rwr","markov2","log_deg","mut","cna","expr"]
+    mods:      preprocessed embedding dict (z-score + L2-norm applied globally)
+    omics:     preprocessed omics dict (z-score applied globally)
+    log_deg:   log1p(degree) array
+    rwr_arr:   RWR scores computed from fold train-HP seeds (per-fold)
+    m2_arr:    Markov-2 scores (per-fold), optional
+
+    Returns: (len(tgt_idx), len(feat_keys)) float32 array
+    Fold-level StandardScaler must be applied by caller.
+    """
+    tgt = np.asarray(tgt_idx)
+    cols = []
+    for k in feat_keys:
+        if   k == "max_seq":    cols.append(max_cosine_sim(mods["seq"],    tgt_idx, seed_idx))
+        elif k == "max_struct": cols.append(max_cosine_sim(mods["struct"], tgt_idx, seed_idx))
+        elif k == "max_go":     cols.append(max_cosine_sim(mods["go"],     tgt_idx, seed_idx))
+        elif k == "rwr":        cols.append(rwr_arr[tgt])
+        elif k == "markov2":
+            if m2_arr is not None: cols.append(m2_arr[tgt])
+            else: cols.append(np.zeros(len(tgt), np.float32))
+        elif k == "log_deg":    cols.append(log_deg[tgt])
+        elif k == "mut":        cols.append(omics["mut"][tgt])
+        elif k == "cna":        cols.append(omics["cna"][tgt])
+        elif k == "expr":       cols.append(omics["expr"][tgt])
+        else: raise ValueError(f"Unknown feature key: {k}")
+    return np.column_stack(cols).astype(np.float32)
+
+
+# STATISTICAL TESTS
+
+
+def bootstrap_ci_aupr(y, p, rng, n=2000):
+    """
+    Bootstrap 95% CI for AUPR.
+    Valid for precision-recall AUC comparison (unlike De Long which is AUROC-only).
+    """
+    vals = []
+    for _ in range(n):
+        ix = rng.integers(0, len(y), len(y))
+        if y[ix].sum() >= 1 and (y[ix] == 0).sum() >= 1:
+            vals.append(average_precision_score(y[ix], p[ix]))
+    return tuple(np.percentile(vals, [2.5, 97.5]))
+
+
+def bootstrap_ci_fmax(y, p, rng, n=2000):
+    """Bootstrap 95% CI for Fmax."""
+    vals = []
+    for _ in range(n):
+        ix = rng.integers(0, len(y), len(y))
+        if y[ix].sum() >= 1 and (y[ix] == 0).sum() >= 1:
+            pr, rc, _ = precision_recall_curve(y[ix], p[ix])
+            vals.append(float((2*pr*rc/(pr+rc+1e-9)).max()))
+    return tuple(np.percentile(vals, [2.5, 97.5]))
+
+
+def ci_overlap(lo1, hi1, lo2, hi2):
+    """True if two 95% CIs overlap → NOT significantly different."""
+    return lo1 < hi2 and lo2 < hi1
+
+
+def delong_auroc(y, sa, sb):
+    """
+    De Long (1988) test for comparing two AUROCs.
+    VALID for AUROC only. Do NOT use for AUPR.
+    Returns: auc_a, auc_b, z_statistic, two-sided p-value.
+    """
+    pm = y == 1; nm = y == 0
+    spa, sna = sa[pm], sa[nm]; spb, snb = sb[pm], sb[nm]
+    m, n = len(spa), len(sna)
+    if m == 0 or n == 0: return np.nan, np.nan, np.nan, np.nan
+
+    def place(sp, sn):
+        m_, n_ = len(sp), len(sn)
+        V10 = np.array([((sn<s).sum()+0.5*(sn==s).sum())/n_ for s in sp])
+        V01 = np.array([((sp>s).sum()+0.5*(sp==s).sum())/m_ for s in sn])
+        return V10, V01
+
+    auc_a = roc_auc_score(y, sa); auc_b = roc_auc_score(y, sb)
+    V10a, V01a = place(spa, sna); V10b, V01b = place(spb, snb)
+    s10aa = np.var(V10a, ddof=1)/m; s01aa = np.var(V01a, ddof=1)/n
+    s10bb = np.var(V10b, ddof=1)/m; s01bb = np.var(V01b, ddof=1)/n
+    s10ab = np.cov(V10a, V10b, ddof=1)[0,1]/m
+    s01ab = np.cov(V01a, V01b, ddof=1)[0,1]/n
+    vd = (s10aa+s01aa) + (s10bb+s01bb) - 2*(s10ab+s01ab)
+    if vd <= 0: return auc_a, auc_b, 0.0, 1.0
+    z = (auc_a - auc_b) / np.sqrt(vd)
+    return auc_a, auc_b, z, float(2*(1-norm.cdf(abs(z))))
+
+
+def fmax(y, p):
+    pr, rc, _ = precision_recall_curve(y, p)
+    return float((2*pr*rc/(pr+rc+1e-9)).max())
+
+
+# CLASSICAL NETWORK METHODS  (topology only, no learned features)
+
+from scipy.stats import hypergeom
+
+def hishigaki_scores(A, N, hp_set):
+    deg = np.asarray(A.sum(1)).flatten().astype(int); n_hp = len(hp_set)
+    s = np.zeros(N, np.float64)
+    for i in range(N):
+        if i in hp_set: continue
+        nbrs = A.indices[A.indptr[i]:A.indptr[i+1]]
+        k_i = int(deg[i]); x_i = int(sum(1 for nb in nbrs if nb in hp_set))
+        if k_i == 0 or x_i == 0: continue
+        pval = hypergeom.sf(x_i-1, N, n_hp, k_i)
+        s[i] = -np.log10(max(pval, 1e-300))
+    return s
+
+
+def mv_scores(A, N, hp_set):
+    sm = np.zeros(N, bool); sm[list(hp_set)] = True
+    return np.array([sm[A.indices[A.indptr[i]:A.indptr[i+1]]].sum()
+                     for i in range(N)], dtype=np.float32)
+
+
+def localnbr_scores(A, N, hp_set, deg):
+    s = np.zeros(N, np.float64)
+    for i in range(N):
+        if i in hp_set: continue
+        nbrs = A.indices[A.indptr[i]:A.indptr[i+1]]
+        x = sum(1 for nb in nbrs if nb in hp_set)
+        s[i] = x / max(np.sqrt(deg[i]), 1)
+    return s
+
+
+def niapu_scores(W, A, N, hp_set, alpha=0.85, beta=0.5, n_iter=50):
+    """
+    NIAPU (Peng et al. 2022, Briefings in Bioinformatics).
+    Combines global RWR proximity with local HP-neighbourhood enrichment.
+    alpha: weight for global RWR term (0.85 from paper)
+    beta:  RWR restart probability (0.5 from paper)
+    """
+    seeds = list(hp_set)
+    r = rwr(W, N, seeds, alpha=beta, n_iter=n_iter)
+    deg = np.asarray(A.sum(1)).flatten(); deg[deg == 0] = 1.0
+    local = np.zeros(N, np.float64)
+    for i in range(N):
+        nbrs = A.indices[A.indptr[i]:A.indptr[i+1]]
+        local[i] = sum(float(r[nb]) for nb in nbrs if nb in hp_set) / deg[i]
+    def n01(x): lo, hi = x.min(), x.max(); return (x-lo)/(hi-lo+1e-12)
+    s_n = alpha*n01(r.astype(np.float64)) + (1-alpha)*n01(local)
+    for i in hp_set: s_n[i] = 0.0
+    return s_n
+
+
+def diamond_scores(A, N, hp_set, max_iter=300):
+    seed_set = set(hp_set); added = list(hp_set)
+    scores = np.zeros(N, np.float32); deg = np.asarray(A.sum(1)).flatten()
+    for step in range(max_iter):
+        cand = {}
+        for s in added:
+            for nb in A.indices[A.indptr[s]:A.indptr[s+1]]:
+                if nb not in seed_set: cand[nb] = cand.get(nb,0)+1
+        if not cand: break
+        ns = len(added); bnode, bval = -1, -1.0
+        for nb, ks in cand.items():
+            k = int(deg[nb])
+            if k == 0: continue
+            val = ks/(k*ns/max(N-ns,1)+1e-9)
+            if val > bval: bval = val; bnode = nb
+        if bnode < 0: break
+        seed_set.add(bnode); added.append(bnode); scores[bnode] = max_iter-step
+    return scores
