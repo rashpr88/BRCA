@@ -1,0 +1,430 @@
+"""
+Protein Structure Embedding Pipeline
+=====================================
+Generates 512-dimensional structural embeddings for proteins using a
+pretrained GearNet (Multiview Contrastive variant) model.
+
+Workflow:
+  1. For each UniProt ID, locate a structure file:
+       - Prefer an experimentally solved structure (PDB, via local mmCIF files)
+       - Fall back to a predicted AlphaFold structure if no PDB entry exists
+  2. Isolate the relevant chain(s) for that UniProt ID
+  3. Build a residue-level graph (sequential + spatial + k-NN edges)
+  4. Run the graph through pretrained GearNet to get a structure embedding
+  5. Average across chains (for multi-chain entries) and save to HDF5
+
+Requires: biopython, torch, torchdrug, h5py
+"""
+
+import os
+import copy
+import json
+import h5py
+import numpy as np
+import torch
+from collections import defaultdict
+
+from Bio.PDB import MMCIFParser, MMCIF2Dict, PDBIO, Select, Structure, Model
+from Bio.PDB.Polypeptide import is_aa
+
+from torchdrug import data, models, layers
+from torchdrug import utils as torchdrug_utils
+
+
+# Compatibility patch
+# TorchDrug's compiled sparse-tensor extension is unavailable in this
+# environment. Replace it with the equivalent pure-Python/PyTorch call.
+def _sparse_coo_tensor_fallback(indices, values, size):
+    return torch.sparse_coo_tensor(indices, values, size)
+
+torchdrug_utils.sparse_coo_tensor = _sparse_coo_tensor_fallback
+
+
+# Configuration
+
+PDB_CIF_DIR = "./mmcif_files"
+ALPHAFOLD_DIRS = ["./alphafold_structures", "./alphafold_structures_biopython"]
+PRETRAINED_CHECKPOINT = "mc_gearnet_edge.pth"
+OUTPUT_H5_FILE = "struct_embeddings_fixed.h5"
+
+BEST_PDB_STRUCTURES_JSON = "best_pdb_structures.json"
+MISSING_UNIPROT_IDS_JSON = "missing_uniprot_ids.json"
+
+EMBEDDING_DIM = 512
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# Model setup
+def build_gearnet_pipeline(checkpoint_path):
+    """
+    Construct the graph-construction layer and GearNet model, then load
+    pretrained weights. Both stay on CPU, matching the configuration the
+    pretrained checkpoint was validated against.
+    """
+    graph_construction_model = layers.GraphConstruction(
+        node_layers=[layers.geometry.AlphaCarbonNode()],
+        edge_layers=[
+            layers.geometry.SequentialEdge(max_distance=2),
+            layers.geometry.SpatialEdge(radius=10.0, min_distance=5),
+            layers.geometry.KNNEdge(k=10, min_distance=5),
+        ],
+        edge_feature="gearnet",
+    )
+
+    gearnet_model = models.GearNet(
+        input_dim=21,
+        hidden_dims=[512, 512, 512, 512, 512, 512],
+        num_relation=7,
+        edge_input_dim=59,
+        num_angle_bin=8,
+        batch_norm=True,
+        concat_hidden=False,
+        short_cut=True,
+        readout="sum",
+    )
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Pretrained checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    gearnet_model.load_state_dict(state_dict)
+
+    gearnet_model.eval()
+    graph_construction_model.eval()
+
+    return graph_construction_model, gearnet_model
+
+
+# Structure file lookup
+def find_cif_file(pdb_id):
+    """Locate a local mmCIF/PDB file for a given PDB ID."""
+    for ext in [".cif", ".pdb"]:
+        for candidate_id in [pdb_id.lower(), pdb_id]:
+            path = os.path.join(PDB_CIF_DIR, candidate_id + ext)
+            if os.path.exists(path):
+                return path
+    return None
+
+
+def find_alphafold_file(uniprot_id):
+    """Locate a local AlphaFold structure file for a given UniProt ID."""
+    filename_patterns = [
+        f"AF-{uniprot_id}-F1-model_v6.cif",
+        f"AF-{uniprot_id}-F1-model_v5.cif",
+        f"AF-{uniprot_id}-F1-model_v4.cif",
+        f"AF-{uniprot_id}-F1-model_v3.cif",
+        f"{uniprot_id}.cif",
+    ]
+    for directory in ALPHAFOLD_DIRS:
+        if not os.path.exists(directory):
+            continue
+        for pattern in filename_patterns:
+            path = os.path.join(directory, pattern)
+            if os.path.exists(path):
+                return path
+    return None
+
+
+def get_uniprot_chain_map_from_cif(cif_file):
+    """
+    Read the UniProt-accession-to-chain mapping embedded in a PDB mmCIF
+    file's _struct_ref_seq records.
+    """
+    try:
+        mmcif_dict = MMCIF2Dict.MMCIF2Dict(cif_file)
+        accessions = mmcif_dict.get("_struct_ref_seq.pdbx_db_accession", [])
+        chain_ids = mmcif_dict.get("_struct_ref_seq.pdbx_strand_id", [])
+
+        if isinstance(accessions, str):
+            accessions = [accessions]
+        if isinstance(chain_ids, str):
+            chain_ids = [chain_ids]
+
+        mapping = defaultdict(list)
+        for accession, chains in zip(accessions, chain_ids):
+            if not accession or not chains:
+                continue
+            for chain_id in str(chains).replace(" ", "").split(","):
+                if chain_id:
+                    mapping[accession].append(chain_id)
+        return dict(mapping)
+
+    except Exception as error:
+        print(f"  Could not parse chain mapping from {cif_file}: {error}")
+        return {}
+
+
+# Embedding generation
+def embed_protein(cif_path, graph_construction_model, gearnet_model, preferred_chains=None):
+    """
+    Generate a structure embedding for a protein.
+
+    Each requested chain is isolated into its own temporary single-chain
+    PDB file, loaded into TorchDrug, passed through the GearNet pipeline,
+    and embedded separately. If multiple chains are requested, their
+    embeddings are averaged.
+    """
+    try:
+        parser = MMCIFParser(QUIET=True)
+        structure = parser.get_structure("protein", cif_path)
+        first_model = list(structure.get_models())[0]
+
+        chains_to_process = []
+        if preferred_chains:
+            chains_to_process = [c for c in first_model.get_chains() if c.get_id() in preferred_chains]
+            if not chains_to_process:
+                print(f"  Preferred chains {preferred_chains} not found, using all chains")
+                chains_to_process = list(first_model.get_chains())
+        else:
+            chains_to_process = list(first_model.get_chains())
+
+        if not chains_to_process:
+            print("  No chains found")
+            return None
+
+        chain_embeddings = []
+
+        for chain in chains_to_process:
+            chain_id = chain.get_id()
+            temp_pdb_path = f"temp_{os.getpid()}_{chain_id}.pdb"
+
+            # Isolate this chain into its own structure so TorchDrug sees
+            # a single, cleanly labelled chain ('A') with no cross-chain
+            # parent references.
+            isolated_structure = Structure.Structure("isolated")
+            isolated_model = Model.Model(0)
+
+            isolated_chain = copy.deepcopy(chain)
+            isolated_chain.parent = None
+            isolated_chain.id = "A"
+
+            isolated_model.add(isolated_chain)
+            isolated_structure.add(isolated_model)
+
+            class ProteinResidueSelect(Select):
+                def accept_chain(self, c):
+                    return c.get_id() == "A"
+
+                def accept_residue(self, r):
+                    return is_aa(r) and "CA" in r
+
+            writer = PDBIO()
+            writer.set_structure(isolated_structure)
+            writer.save(temp_pdb_path, ProteinResidueSelect())
+
+            if not os.path.exists(temp_pdb_path) or os.path.getsize(temp_pdb_path) <= 500:
+                if os.path.exists(temp_pdb_path):
+                    os.remove(temp_pdb_path)
+                continue
+
+            try:
+                protein = data.Protein.from_pdb(
+                    temp_pdb_path, atom_feature="position", residue_feature="symbol"
+                )
+                protein.view = "residue"
+
+                # Ensure the expected 21-dim one-hot residue feature.
+                if protein.node_feature.shape[-1] != 21:
+                    one_hot_feature = torch.nn.functional.one_hot(protein.residue_type, 21).float()
+                    object.__setattr__(protein, "node_feature", one_hot_feature)
+
+                object.__setattr__(protein, "node_position", protein.node_position)
+
+                batch = data.Protein.pack([protein])
+                graph = graph_construction_model(batch)
+
+                if graph.num_relation.item() < 7:
+                    object.__setattr__(graph, "num_relation", torch.tensor(7))
+
+                with torch.no_grad():
+                    output = gearnet_model(graph, graph.node_feature.float())
+
+                embedding = output["graph_feature"].cpu().numpy()
+                chain_embeddings.append(embedding[0] if embedding.ndim > 1 else embedding)
+                print(f"    Chain {chain_id}: {protein.num_residue} residues embedded")
+
+            except Exception as error:
+                print(f"    Error embedding chain {chain_id}: {error}")
+
+            finally:
+                if os.path.exists(temp_pdb_path):
+                    os.remove(temp_pdb_path)
+
+        if not chain_embeddings:
+            return None
+
+        if len(chain_embeddings) > 1:
+            print(f"  Averaged {len(chain_embeddings)} chains")
+            return np.mean(np.vstack(chain_embeddings), axis=0)
+
+        return chain_embeddings[0]
+
+    except Exception as error:
+        print(f"Error processing {cif_path}: {error}")
+        return None
+
+# Batch processing
+def load_id_list(json_path):
+    """
+    Load a JSON file of UniProt IDs, accepting either a list of IDs or a
+    dict keyed by ID. Always returns a dict (ID -> info).
+    """
+    with open(json_path) as f:
+        raw = json.load(f)
+
+    if isinstance(raw, list):
+        items = {}
+        for entry in raw:
+            if isinstance(entry, str):
+                items[entry] = entry
+            elif isinstance(entry, dict) and "uniprot_id" in entry:
+                items[entry["uniprot_id"]] = entry
+        print(f"Loaded {len(items)} IDs from list format: {json_path}")
+        return items
+
+    if isinstance(raw, dict):
+        return raw
+
+    raise ValueError(f"Unrecognized JSON structure in {json_path}: {type(raw)}")
+
+
+def process_structures_to_h5(json_path, output_h5_path, graph_construction_model,
+                              gearnet_model, source_type="pdb"):
+    """
+    Process every UniProt ID in the given JSON file, generate an
+    embedding for each, and append results to the output HDF5 file.
+    Already-embedded IDs are skipped.
+    """
+    items = load_id_list(json_path)
+
+    existing_ids = set()
+    if os.path.exists(output_h5_path):
+        try:
+            with h5py.File(output_h5_path, "r") as hf:
+                existing_ids = set(hf.keys())
+            print(f"Found {len(existing_ids)} existing embeddings in {output_h5_path}")
+        except Exception as error:
+            print(f"Could not read existing HDF5 file ({error}); continuing")
+
+    success_count = 0
+    skipped_count = 0
+    total = len(items)
+
+    print(f"\n{'=' * 60}")
+    print(f"Processing {source_type.upper()} structures: {total} total")
+    print(f"{'=' * 60}")
+
+    with h5py.File(output_h5_path, "a") as hf:
+        for index, (uniprot_id, info) in enumerate(items.items(), start=1):
+            if uniprot_id in hf or uniprot_id in existing_ids:
+                print(f"{index}/{total}: {uniprot_id} already exists, skipping")
+                skipped_count += 1
+                continue
+
+            print(f"\n{index}/{total}: {uniprot_id}")
+
+            if source_type == "pdb":
+                pdb_id = info.get("pdb_id", uniprot_id) if isinstance(info, dict) else info
+                cif_path = find_cif_file(pdb_id)
+                if not cif_path:
+                    print(f"  PDB structure not found: {pdb_id}")
+                    continue
+
+                chain_map = get_uniprot_chain_map_from_cif(cif_path)
+                preferred_chains = chain_map.get(uniprot_id, [])
+                print(f"  Using file: {os.path.basename(cif_path)}")
+                if preferred_chains:
+                    print(f"  Preferred chains: {preferred_chains}")
+
+            else:  # AlphaFold
+                cif_path = find_alphafold_file(uniprot_id)
+                if not cif_path:
+                    print(f"  AlphaFold structure not found: {uniprot_id}")
+                    continue
+                preferred_chains = []
+                print(f"  Using file: {os.path.basename(cif_path)}")
+
+            embedding = embed_protein(
+                cif_path, graph_construction_model, gearnet_model, preferred_chains
+            )
+
+            if embedding is None:
+                print(f"  Failed to generate embedding for {uniprot_id}")
+                continue
+
+            try:
+                embedding = np.asarray(embedding).astype(np.float32).flatten()
+                hf.create_dataset(
+                    uniprot_id,
+                    data=embedding,
+                    shape=embedding.shape,
+                    dtype="float32",
+                    compression="gzip",
+                    chunks=True,
+                )
+                success_count += 1
+                print(f"  Saved {uniprot_id} ({embedding.shape[0]}-dim)")
+            except Exception as error:
+                print(f"  Failed to write {uniprot_id} to HDF5: {error}")
+
+            if index % 10 == 0:
+                print(f"\nProgress: {index}/{total} processed, "
+                      f"{success_count} succeeded, {skipped_count} skipped")
+
+    failed_count = total - success_count - skipped_count
+    print(f"\n{source_type.upper()} complete: "
+          f"{success_count} new, {skipped_count} skipped, {failed_count} failed")
+    return success_count
+
+# Main
+def main():
+    print("Starting protein structure embedding generation")
+    print(f"Using device: {DEVICE} (model runs on CPU regardless, per checkpoint compatibility)")
+    print(f"Pretrained checkpoint: {PRETRAINED_CHECKPOINT}")
+    print(f"Output file: {OUTPUT_H5_FILE}")
+
+    graph_construction_model, gearnet_model = build_gearnet_pipeline(PRETRAINED_CHECKPOINT)
+    print("GearNet pipeline initialised with pretrained weights")
+
+    total_success = 0
+
+    if os.path.exists(BEST_PDB_STRUCTURES_JSON):
+        print(f"\nProcessing PDB structures from {BEST_PDB_STRUCTURES_JSON}")
+        total_success += process_structures_to_h5(
+            BEST_PDB_STRUCTURES_JSON, OUTPUT_H5_FILE,
+            graph_construction_model, gearnet_model, source_type="pdb",
+        )
+    else:
+        print(f"{BEST_PDB_STRUCTURES_JSON} not found, skipping PDB structures")
+
+    if os.path.exists(MISSING_UNIPROT_IDS_JSON):
+        print(f"\nProcessing AlphaFold structures from {MISSING_UNIPROT_IDS_JSON}")
+        total_success += process_structures_to_h5(
+            MISSING_UNIPROT_IDS_JSON, OUTPUT_H5_FILE,
+            graph_construction_model, gearnet_model, source_type="alphafold",
+        )
+    else:
+        print(f"{MISSING_UNIPROT_IDS_JSON} not found, skipping AlphaFold structures")
+
+    if os.path.exists(OUTPUT_H5_FILE):
+        try:
+            with h5py.File(OUTPUT_H5_FILE, "r") as hf:
+                num_embeddings = len(hf.keys())
+                print(f"\n{'=' * 60}")
+                print(f"Done. {num_embeddings} embeddings saved to {OUTPUT_H5_FILE}")
+                print(f"{'=' * 60}")
+
+                if num_embeddings > 0:
+                    sample_id = list(hf.keys())[0]
+                    sample = hf[sample_id][:]
+                    print(f"\nSample: {sample_id} -> shape {sample.shape}")
+                    print(f"Mean: {np.mean(sample):.4f}, Std: {np.std(sample):.4f}")
+        except Exception as error:
+            print(f"\nCould not read final HDF5 file: {error}")
+    else:
+        print("\nNo embeddings were generated. Check input files and paths.")
+
+
+if __name__ == "__main__":
+    main()
