@@ -1,0 +1,422 @@
+"""
+Feature Ablation + Best-Network Selection
+=====================================================
+Runnable Colab cell. Requires `cpdb_edges` already in memory
+(from the CPDB parser cell) and benchmark.py for the fixed HP split.
+
+Pipeline:
+  1. Build four networks: STRING | CPDB | STRING∩CPDB | STRING∪CPDB
+  2. Load embeddings (seq/struct/go) + omics (mut/cna/expr), gene-keyed
+  3. Run repeated stratified CV ablation (8 feature configs) per network
+  4. Pick the locked (best) config per network by mean CV AUPR
+  5. Compare networks, select the overall winner
+  6. Save network_comparison.csv + ablation_detail.json
+"""
+
+import os, csv, json, time, warnings, importlib.util
+import numpy as np
+import networkx as nx
+import scipy.sparse as sp
+import h5py
+
+from sklearn.preprocessing import normalize, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import average_precision_score
+from scipy.stats import ttest_rel
+
+warnings.filterwarnings("ignore")
+
+
+# PATHS + CONFIG
+BASE      = "/content/drive/MyDrive/MMSE BC/"
+GML_PATH  = BASE + "Copy of ppi_network_filtered_new4.gml"
+H5_PATH   = BASE + "Copy of node_embeddings_filtered_new4.h5"
+BENCH     = BASE + "benchmark.py"
+OMICS_CSV = BASE + "stage3/stage3c_omics_features.csv"
+OUT_DIR   = BASE + "multi_network/"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+BASE_SEED  = 42
+N_REPEATS  = 20
+N_FOLDS    = 10
+NEG_RATIO  = 10
+RWR_ALPHA  = 0.15
+RWR_ITER   = 50
+
+KEY_CONFIGS = [
+    ("FULL",          ["max_seq", "max_struct", "max_go", "rwr", "markov2",
+                        "log_deg", "mut", "cna", "expr"]),
+    ("seq+rwr+mut ★",  ["max_seq", "rwr", "mut"]),
+    ("seq+rwr",        ["max_seq", "rwr"]),
+    ("rwr+omics",      ["rwr", "mut", "cna", "expr"]),
+    ("seq+rwr+omics",  ["max_seq", "rwr", "mut", "cna", "expr"]),
+    ("topo_only",      ["rwr", "markov2", "log_deg"]),
+    ("bio_only",       ["max_seq", "max_struct", "max_go"]),
+    ("omics_only",     ["mut", "cna", "expr"]),
+]
+
+
+# GRAPH HELPERS
+
+def build_adj(gene_list, edge_pairs):
+    """Symmetric binary CSR adjacency + row-normalized walk matrix."""
+    N = len(gene_list)
+    g2i = {g: i for i, g in enumerate(gene_list)}
+    seen, rs, cs = set(), [], []
+    for g1, g2 in edge_pairs:
+        if g1 in g2i and g2 in g2i:
+            i, j = g2i[g1], g2i[g2]
+            pair = (min(i, j), max(i, j))
+            if pair not in seen:
+                seen.add(pair)
+                rs += [i, j]; cs += [j, i]
+    A = sp.csr_matrix(([1.0] * len(rs), (rs, cs)), shape=(N, N))
+    d = np.asarray(A.sum(1)).flatten(); d[d == 0] = 1.0
+    W = (sp.diags(1.0 / d) @ A).tocsr()
+    deg = np.asarray(A.sum(1)).flatten()
+    return A, W, deg
+
+
+def rwr_fn(W, N, seeds, alpha=RWR_ALPHA, n_iter=RWR_ITER):
+    s = np.zeros(N, np.float32); s[seeds] = 1. / len(seeds); r = s.copy()
+    for _ in range(n_iter):
+        r = (1 - alpha) * (W.T @ r) + alpha * s
+    return r
+
+
+def markov2_fn(W, N, seeds):
+    s = np.zeros(N, np.float32); s[seeds] = 1. / len(seeds)
+    return (W.T @ (W.T @ s)).astype(np.float32)
+
+
+# FEATURE LOADING
+
+def load_embeddings(h5_path, genes):
+    """Load seq/struct/go embeddings → global z-score + L2-norm."""
+    mods = {}
+    with h5py.File(h5_path, "r") as f:
+        for key in ["seq", "struct", "go"]:
+            if key not in f:
+                continue
+            s0 = next(iter(f[key].keys()))
+            d = np.asarray(f[key][s0][()]).flatten().shape[0]
+            M = np.zeros((len(genes), d), np.float32)
+            available = set(f[key].keys())
+            for i, g in enumerate(genes):
+                if str(g) in available:
+                    M[i] = np.asarray(f[key][str(g)][()]).flatten()
+            M = StandardScaler().fit_transform(M).astype(np.float32)
+            M = normalize(M, axis=1).astype(np.float32)
+            mods[key] = M
+    return mods
+
+
+def load_omics(csv_path, genes):
+    """Load omics → global z-score (no L2-norm: scalars, not vectors)."""
+    g2i = {str(g): i for i, g in enumerate(genes)}
+    raw = {k: np.zeros(len(genes), np.float32) for k in ["mut", "cna", "expr"]}
+    key_map = {"mut_freq": "mut", "cna_freq": "cna", "expr_zscore": "expr"}
+    if os.path.exists(csv_path):
+        with open(csv_path) as f:
+            for row in csv.DictReader(f):
+                if row["gene"] in g2i:
+                    i = g2i[row["gene"]]
+                    for col, key in key_map.items():
+                        if col in row:
+                            raw[key][i] = float(row[col])
+
+    def gz(x):
+        mu, sd = x.mean(), x.std()
+        return ((x - mu) / max(sd, 1e-9)).astype(np.float32)
+
+    return {k: gz(v) for k, v in raw.items()}
+
+
+def max_cosim(E, tgt, seeds):
+    """Max cosine similarity with leave-self-out masking."""
+    T = E[np.asarray(tgt)]; S = E[np.asarray(seeds)]
+    sim = (T @ S.T).astype(np.float32)
+    eq = np.asarray(tgt)[:, None] == np.asarray(seeds)[None, :]
+    if eq.any():
+        sim = sim.copy(); sim[eq] = np.nan
+    m = np.nanmax(sim, axis=1)
+    return np.where(np.isnan(m), 0.0, m).astype(np.float32)
+
+
+def assemble_X(feat_keys, mods, omics, log_deg, tgt, seeds, rwr_arr, m2_arr=None):
+    """Assemble feature matrix. Fold-level StandardScaler applied by caller."""
+    tgt = np.asarray(tgt); cols = []
+    for k in feat_keys:
+        if k == "max_seq":
+            cols.append(max_cosim(mods["seq"], tgt.tolist(), seeds))
+        elif k == "max_struct":
+            cols.append(max_cosim(mods["struct"], tgt.tolist(), seeds))
+        elif k == "max_go":
+            cols.append(max_cosim(mods["go"], tgt.tolist(), seeds))
+        elif k == "rwr":
+            cols.append(rwr_arr[tgt])
+        elif k == "markov2":
+            cols.append(m2_arr[tgt] if m2_arr is not None else np.zeros(len(tgt), np.float32))
+        elif k == "log_deg":
+            cols.append(log_deg[tgt])
+        elif k == "mut":
+            cols.append(omics["mut"][tgt])
+        elif k == "cna":
+            cols.append(omics["cna"][tgt])
+        elif k == "expr":
+            cols.append(omics["expr"][tgt])
+    return np.column_stack(cols).astype(np.float32)
+
+# ABLATION + NETWORK SELECTION
+
+def run_ablation(W, N, train_hp, train_bg_pool, mods, omics, log_deg):
+    """
+    Repeated stratified k-fold CV over each feature config.
+    Returns the locked (best) config + per-config stats.
+    """
+    runnable = [
+        (cfg_name, feats) for cfg_name, feats in KEY_CONFIGS
+        if not {f[4:] for f in feats if f.startswith("max_")} - set(mods)
+    ]
+    cv_auprs = {cfg_name: [] for cfg_name, _ in runnable}
+
+    for rep in range(N_REPEATS):
+        seed = BASE_SEED + rep
+        rng = np.random.default_rng(seed)
+
+        n_neg = min(len(train_hp) * NEG_RATIO, len(train_bg_pool))
+        neg = rng.choice(train_bg_pool, n_neg, replace=False)
+        pool = np.concatenate([train_hp, neg])
+        y_pl = np.array([1] * len(train_hp) + [0] * len(neg), np.int32)
+
+        skf = StratifiedKFold(N_FOLDS, shuffle=True, random_state=seed)
+
+        for cfg_name, feats in runnable:
+            oof = np.zeros(len(pool), np.float64)
+
+            for tr_idx, va_idx in skf.split(pool, y_pl):
+                seeds = pool[tr_idx][y_pl[tr_idx] == 1].tolist()
+                rwr_f = rwr_fn(W, N, seeds)
+                m2_f = markov2_fn(W, N, seeds) if "markov2" in feats else None
+
+                X_tr = assemble_X(feats, mods, omics, log_deg,
+                                   pool[tr_idx].tolist(), seeds, rwr_f, m2_f)
+                X_va = assemble_X(feats, mods, omics, log_deg,
+                                   pool[va_idx].tolist(), seeds, rwr_f, m2_f)
+
+                scaler = StandardScaler().fit(X_tr)
+                clf = LogisticRegression(class_weight="balanced",
+                                          max_iter=1000, C=1.0, random_state=seed)
+                clf.fit(scaler.transform(X_tr), y_pl[tr_idx])
+                oof[va_idx] = clf.predict_proba(scaler.transform(X_va))[:, 1]
+
+            cv_auprs[cfg_name].append(average_precision_score(y_pl, oof))
+
+        if (rep + 1) % 5 == 0:
+            print(f"      repeat {rep + 1}/{N_REPEATS} done")
+
+    # Summarize: pick config with highest mean CV AUPR
+    full_arr = np.array(cv_auprs["FULL"])
+    best_cfg, best_mean = "FULL", full_arr.mean()
+    stats = {}
+
+    for cfg_name, _ in runnable:
+        arr = np.array(cv_auprs[cfg_name])
+        mean, std = arr.mean(), arr.std()
+        if cfg_name == "FULL":
+            p_val, n_better = 1.0, 0
+        else:
+            try:
+                _, p_val = ttest_rel(arr, full_arr)
+            except Exception:
+                p_val = np.nan
+            n_better = int((arr > full_arr).sum())
+            if mean > best_mean:
+                best_mean, best_cfg = mean, cfg_name
+
+        stats[cfg_name] = {"mean": float(mean), "std": float(std),
+                            "p_ttest": float(p_val), "better": n_better}
+
+    locked_feats = dict(KEY_CONFIGS)[best_cfg]
+    return {
+        "best_config": best_cfg,
+        "best_cv_aupr": float(best_mean),
+        "locked_feats": locked_feats,
+        "abl_stats": stats,
+    }
+
+
+def select_best_network(network_results: dict):
+    """Pick the network with the highest CV AUPR (locked config)."""
+    best_net, best_cv = None, 0.0
+    for net_name, r in network_results.items():
+        if r is None:
+            continue
+        if r["best_cv_aupr"] > best_cv:
+            best_cv, best_net = r["best_cv_aupr"], net_name
+    return best_net, best_cv
+
+# MAIN
+
+
+def main(cpdb_edges):
+    t_start = time.time()
+    print(f"\n{'=' * 72}\n  MMSE-BC Ablation + Network Selection\n{'=' * 72}")
+
+    # Fixed HP split from benchmark.py 
+    spec = importlib.util.spec_from_file_location("benchmark", BENCH)
+    bench = importlib.util.module_from_spec(spec); spec.loader.exec_module(bench)
+    data = bench.load_data()
+
+    nodes = data["nodes"]
+    hp_idx_orig = np.asarray(data["hp_train"])
+    test_idx = np.asarray(data["test_idx"])
+    y_test_full = np.asarray(data["y_test"])
+
+    train_hp_genes = [str(nodes[i]) for i in hp_idx_orig]
+    test_hp_genes = [str(nodes[i]) for i in test_idx if y_test_full[i] == 1.0]
+    test_bg_genes = [str(nodes[i]) for i in test_idx if y_test_full[i] == 0.0]
+
+    print(f"  Train HPs: {len(train_hp_genes)}  Test HPs: {len(test_hp_genes)}  "
+          f"Test bg: {len(test_bg_genes)}")
+
+    # ── Build four networks ─────────────────────────────────────────
+    print(f"\n[1] Building networks...")
+    G_str = nx.read_gml(GML_PATH)
+    str_genes = [str(n) for n in G_str.nodes()]
+    str_edges = set(tuple(sorted([str(u), str(v)])) for u, v in G_str.edges())
+    str_gene_set = set(str_genes)
+
+    cpdb_gene_set = set()
+    for g1, g2 in cpdb_edges:
+        cpdb_gene_set.add(g1); cpdb_gene_set.add(g2)
+    cpdb_genes = sorted(cpdb_gene_set)
+
+    inter_gene_set = str_gene_set & cpdb_gene_set
+    inter_genes = sorted(inter_gene_set)
+    inter_edges = {e for e in str_edges & cpdb_edges
+                   if e[0] in inter_gene_set and e[1] in inter_gene_set}
+
+    union_gene_set = str_gene_set | cpdb_gene_set
+    union_genes = sorted(union_gene_set)
+    union_edges = str_edges | cpdb_edges
+
+    NETWORKS = {
+        "STRING":      {"genes": str_genes,   "edges": str_edges},
+        "CPDB":        {"genes": cpdb_genes,  "edges": cpdb_edges},
+        "STRING∩CPDB": {"genes": inter_genes, "edges": inter_edges},
+        "STRING∪CPDB": {"genes": union_genes, "edges": union_edges},
+    }
+
+    for net_name, net in NETWORKS.items():
+        A, W, deg = build_adj(net["genes"], net["edges"])
+        net["A"], net["W"], net["deg"] = A, W, deg
+        gene_set = set(net["genes"])
+        n_tr = sum(1 for g in train_hp_genes if g in gene_set)
+        n_te = sum(1 for g in test_hp_genes if g in gene_set)
+        print(f"  {net_name:<16} {len(net['genes']):>6} nodes  {A.nnz // 2:>7} edges  "
+              f"train_HP={n_tr}/{len(train_hp_genes)}  test_HP={n_te}/{len(test_hp_genes)}")
+
+    # ── Load embeddings + omics once on the union, subset per network ─
+    print(f"\n[2] Loading embeddings + omics...")
+    union_mods = load_embeddings(H5_PATH, union_genes)
+    union_omics = load_omics(OMICS_CSV, union_genes)
+    union_g2i = {g: i for i, g in enumerate(union_genes)}
+
+    def get_network_arrays(net_genes):
+        idx = np.array([union_g2i[g] for g in net_genes], dtype=np.int64)
+        return ({k: v[idx] for k, v in union_mods.items()},
+                {k: v[idx] for k, v in union_omics.items()})
+
+    # ── Run ablation per network ────────────────────────────────────
+    print(f"\n[3] Running ablation on each network...")
+    network_results = {}
+
+    for net_name, net in NETWORKS.items():
+        print(f"\n  {'─' * 60}\n  NETWORK: {net_name}\n  {'─' * 60}")
+        genes = net["genes"]; N = len(genes)
+        A, W, deg = net["A"], net["W"], net["deg"]
+        g2i = {g: i for i, g in enumerate(genes)}
+        log_deg = np.log1p(deg).astype(np.float32)
+        mods, omics = get_network_arrays(genes)
+
+        train_hp = np.array([g2i[g] for g in train_hp_genes if g in g2i], np.int64)
+        test_hp = np.array([g2i[g] for g in test_hp_genes if g in g2i], np.int64)
+        test_bg = np.array([g2i[g] for g in test_bg_genes if g in g2i], np.int64)
+
+        if len(train_hp) < 20:
+            print(f"  ⚠  Only {len(train_hp)} train HPs — skipping")
+            network_results[net_name] = None
+            continue
+
+        all_hp_set = set(train_hp.tolist()) | set(test_hp.tolist())
+        train_bg_pool = np.array(
+            [i for i in range(N) if i not in all_hp_set and i not in set(test_bg.tolist())],
+            np.int64)
+
+        result = run_ablation(W, N, train_hp, train_bg_pool, mods, omics, log_deg)
+        result["n_nodes"] = N
+        result["n_edges"] = A.nnz // 2
+        result["n_train_hp"] = len(train_hp)
+        result["n_test_hp"] = len(test_hp)
+
+        print(f"\n  Locked: {result['best_config']}  CV AUPR={result['best_cv_aupr']:.4f}  "
+              f"feats={result['locked_feats']}")
+        network_results[net_name] = result
+
+    #Select winner
+    best_net, best_cv = select_best_network(network_results)
+
+    print(f"\n{'=' * 72}\n  NETWORK COMPARISON\n{'=' * 72}")
+    print(f"  {'Network':<16} {'Nodes':>6} {'Edges':>8} {'BestCfg':<22} {'CV AUPR':>8}")
+    print("  " + "─" * 64)
+    for net_name, r in network_results.items():
+        if r is None:
+            print(f"  {net_name:<16} SKIPPED"); continue
+        print(f"  {net_name:<16} {r['n_nodes']:>6} {r['n_edges']:>8} "
+              f"{r['best_config']:<22} {r['best_cv_aupr']:>8.4f}")
+    print(f"\n  ★ WINNER: {best_net}  CV AUPR={best_cv:.4f}")
+
+    #Save results
+    summary = []
+    for net_name, r in network_results.items():
+        if r is None:
+            continue
+        summary.append({
+            "network": net_name,
+            "n_nodes": r["n_nodes"],
+            "n_edges": r["n_edges"],
+            "n_train_hp": r["n_train_hp"],
+            "n_test_hp": r["n_test_hp"],
+            "best_config": r["best_config"],
+            "cv_aupr": round(r["best_cv_aupr"], 4),
+            "locked_features": "|".join(r["locked_feats"]),
+            "is_winner": net_name == best_net,
+        })
+
+    with open(OUT_DIR + "network_comparison.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
+        w.writeheader(); w.writerows(summary)
+
+    with open(OUT_DIR + "ablation_detail.json", "w") as f:
+        json.dump({
+            "winner": best_net,
+            "winner_cv_aupr": float(best_cv),
+            "networks": {k: {"best_config": v["best_config"],
+                              "cv_aupr": v["best_cv_aupr"],
+                              "abl_stats": v["abl_stats"]}
+                         for k, v in network_results.items() if v},
+            "runtime_min": round((time.time() - t_start) / 60, 1),
+        }, f, indent=2)
+
+    print(f"\n  Saved → {OUT_DIR}network_comparison.csv")
+    print(f"  Saved → {OUT_DIR}ablation_detail.json")
+    print(f"  Runtime: {round((time.time() - t_start) / 60, 1)} min")
+
+    return network_results, best_net
+
+
+# Run (cpdb_edges must already be in memory from the CPDB parser cell)
+if __name__ == "__main__":
+    network_results, best_net = main(cpdb_edges)  # noqa: F821
