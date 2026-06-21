@@ -1,0 +1,290 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+import leidenalg, igraph as ig
+from collections import Counter
+
+
+# Modified Precision curve 
+
+print("\n Modified Precision cutoff ...")
+
+DEPS_CSV  = "/content/drive/MyDrive/MMSE BC/multi_network/brca_deps.csv"
+dep_df        = pd.read_csv(DEPS_CSV)
+dep_genes_all = set(dep_df.loc[dep_df["is_DEP"], "gene"].tolist())
+dep_genes_net = dep_genes_all & set(genes)
+dep_indep     = dep_genes_net - all_hp_names   # exclude HPs — avoid circularity
+dep_indep_idx = {g2i[g] for g in dep_indep}
+
+print(f"  Total DEPs:                {len(dep_genes_all)}")
+print(f"  DEPs in network:           {len(dep_genes_net)}")
+print(f"  Independent DEPs (non-HP): {len(dep_indep)}")
+
+# Rank all non-HP candidates by PRIMA-BC
+cand_mask   = np.array([i not in all_hp_s for i in range(N_nodes)])
+cand_idx    = np.where(cand_mask)[0]
+cand_sorted = cand_idx[np.argsort(-prima_all[cand_idx])]
+
+# ── Compute MP curve ──────────────────────────────────────────────────
+N_MAX       = min(2000, len(cand_sorted))
+N_MIN_VALID = 50
+mp_curve    = np.zeros(N_MAX)
+n_dep_hits  = 0
+for n_i in range(N_MAX):
+    if cand_sorted[n_i] in dep_indep_idx:
+        n_dep_hits += 1
+    mp_curve[n_i] = n_dep_hits / (n_i + 1)
+
+# Auto N* = argmax MP(N) for N >= 50
+N_star_auto  = int(np.argmax(mp_curve[N_MIN_VALID-1:]) + N_MIN_VALID)
+mp_star_auto = float(mp_curve[N_star_auto - 1])
+
+# Chosen N* = 100 (principled extension; see methods)
+N_CHOSEN     = 100
+mp_chosen    = float(mp_curve[N_CHOSEN - 1])
+dep_hits_chosen = int(mp_chosen * N_CHOSEN)
+
+print(f"\n  Auto N* (peak):  N={N_star_auto}  MP={mp_star_auto:.4f}  "
+      f"({int(mp_star_auto*N_star_auto)} DEPs)")
+print(f"  Chosen N*:       N={N_CHOSEN}  MP={mp_chosen:.4f}  "
+      f"({dep_hits_chosen} DEPs)  [extended for network resolution]")
+
+# Table
+print(f"\n  {'N':>5}  {'MP':>8}  {'DEP hits':>9}")
+print("  " + "─"*30)
+for n in sorted(set([50, N_star_auto, 100, 200, 500, 1000, 2000])):
+    if 1 <= n <= N_MAX:
+        mp = mp_curve[n-1]; dh = int(mp*n)
+        tags = []
+        if n == N_star_auto: tags.append("← auto N*")
+        if n == N_CHOSEN:    tags.append("← chosen N*")
+        print(f"  {n:>5}  {mp:>8.4f}  {dh:>9}  {' '.join(tags)}")
+
+# Save MP curve CSV
+MP_CSV = OUT_DIR + "prima_bc_mp_curve.csv"
+with open(MP_CSV, "w") as f:
+    f.write("N,modified_precision,dep_hits,is_auto_Nstar,is_chosen_Nstar\n")
+    for n_i in range(N_MAX):
+        f.write(f"{n_i+1},{mp_curve[n_i]:.5f},"
+                f"{int(mp_curve[n_i]*(n_i+1))},"
+                f"{n_i+1==N_star_auto},{n_i+1==N_CHOSEN}\n")
+print(f"\n  MP curve → {MP_CSV}")
+
+# ── Plot ──────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(10, 4))
+xs = np.arange(1, N_MAX + 1)
+ax.plot(xs, mp_curve, color="#2176ae", lw=1.8, label="MP")
+ax.axvline(N_star_auto, color="#f4a261", lw=1.4, ls=":",
+           label=f"Auto N*={N_star_auto}  MP={mp_star_auto:.3f}")
+ax.axvline(N_CHOSEN, color="#e84855", lw=1.5, ls="--",
+           label=f"Chosen N*={N_CHOSEN}  MP={mp_chosen:.3f}")
+ax.scatter([N_star_auto], [mp_star_auto], color="#f4a261", zorder=5, s=60)
+ax.scatter([N_CHOSEN],    [mp_chosen],    color="#e84855", zorder=5, s=60)
+ax.set_xlabel("Top-N candidates (ranked by NetMutSeq score)", fontsize=11)
+ax.set_ylabel("Modified Precision (MP)", fontsize=11)
+ax.set_title("Modified Precision Curve", fontsize=12)
+ax.legend(fontsize=10); ax.set_xlim(1, N_MAX)
+ax.set_ylim(0, max(mp_curve.max() * 1.15, 0.01))
+ax.grid(alpha=0.3); plt.tight_layout()
+PLOT_PATH = OUT_DIR + "prima_bc_mp_curve.png"
+plt.savefig(PLOT_PATH, dpi=150); plt.show()
+print(f"  Plot → {PLOT_PATH}")
+
+# ── Final candidates = DEPs within top-N_CHOSEN only (De Silva 2025) ─
+tier1_idx = [i for i in cand_sorted[:N_CHOSEN]]
+t1_genes  = [genes[i] for i in tier1_idx]
+t1_set    = set(t1_genes)
+print(f"\n  Top-{N_CHOSEN} by PRIMA-BC:       {N_CHOSEN}")
+print(f"  DEPs within top-{N_CHOSEN}:      {len(t1_genes)}  ← final candidates")
+print(f"  Top-10: {t1_genes[:10]}")
+
+# Subnetwork + Leiden + Hub cartography (De Silva 2025 exact)
+
+print(f"\n[7/7] Subnetwork + Leiden + hub cartography (De Silva 2025)...")
+
+# De Silva 2025 exact thresholds:
+#   Z >= 1.5  → intra-modular hub  (used 1.5 not 2.5; 2.5 missed top hub)
+#   PC > 0.5  → inter-modular hub
+#   Min module size: 6 nodes
+Z_THRESH     = 1.5
+PC_THRESH    = 0.5
+MIN_MOD_SIZE = 6
+LEIDEN_GAMMA = 1.0   # Louvain-equivalent resolution
+
+# ── Build subnetwork: DEP candidates + HPs ───────────────────────────
+subnet_genes = t1_set | all_hp_names
+present      = [g for g in subnet_genes if g in G_union]
+G_sub        = G_union.subgraph(present).copy()
+n_iso        = sum(1 for n in G_sub if G_sub.degree(n) == 0)
+print(f"  Subnetwork: {G_sub.number_of_nodes()} nodes  "
+      f"{G_sub.number_of_edges()} edges  ({n_iso} isolated)")
+
+# ── Leiden community detection ────────────────────────────────────────
+non_iso  = [n for n in G_sub if G_sub.degree(n) > 0]
+iso_list = [n for n in G_sub if G_sub.degree(n) == 0]
+nl       = list(non_iso); n2i_l = {n: i for i, n in enumerate(nl)}
+edges_l  = [(n2i_l[u], n2i_l[v])
+            for u, v in G_sub.subgraph(non_iso).edges()]
+Gig      = ig.Graph(n=len(nl), edges=edges_l, directed=False)
+Gig.vs["name"] = nl
+part = leidenalg.find_partition(
+    Gig, leidenalg.RBConfigurationVertexPartition,
+    resolution_parameter=LEIDEN_GAMMA, seed=42)
+
+raw_mod   = {nl[i]: int(m) for i, m in enumerate(part.membership)}
+for g in iso_list: raw_mod[g] = -1
+sizes     = Counter(raw_mod.values())
+
+# Exclude modules with < 6 nodes (De Silva: < 6)
+module_of = {n: (m if m >= 0 and sizes[m] >= MIN_MOD_SIZE else -1)
+             for n, m in raw_mod.items()}
+Q         = float(part.modularity)
+n_mod     = len({v for v in module_of.values() if v >= 0})
+print(f"  Leiden gamma={LEIDEN_GAMMA}: {n_mod} modules "
+      f"(>={MIN_MOD_SIZE} nodes)  Q={Q:.4f}")
+
+# ── Within-module Z-score (De Silva eq.10) ───────────────────────────
+mod_groups = {}
+for n, m in module_of.items():
+    mod_groups.setdefault(m, []).append(n)
+
+z_score = {}
+for m, ns in mod_groups.items():
+    if m < 0:
+        for n in ns: z_score[n] = 0.0
+        continue
+    nset = set(ns)
+    # ks_i = within-module degree
+    kw   = {n: sum(1 for nb in G_sub.neighbors(n) if nb in nset) for n in ns}
+    vals = np.array(list(kw.values()), dtype=float)
+    if len(vals) <= 1 or vals.std() == 0:
+        for n in ns: z_score[n] = 0.0
+    else:
+        mu_m, sd_m = vals.mean(), vals.std()
+        for n in ns: z_score[n] = float((kw[n] - mu_m) / sd_m)
+
+# ── Participation Coefficient (De Silva eq.11) ────────────────────────
+# PC_i = 1 - sum_s( (k_si / k_i)^2 )
+# k_i = total degree, k_si = edges to module s
+P_score = {}
+for n in G_sub.nodes():
+    nbrs = list(G_sub.neighbors(n)); ki = len(nbrs)
+    if ki == 0: P_score[n] = 0.0; continue
+    cnt = {}
+    for nb in nbrs:
+        m = module_of.get(nb, -1); cnt[m] = cnt.get(m, 0) + 1
+    P_score[n] = float(1.0 - sum((c/ki)**2 for c in cnt.values()))
+
+# ── Hub classification (De Silva 2025 exact thresholds) ──────────────
+# Z >= 1.5  AND  PC > 0.5  → inter-modular hub
+# Z >= 1.5  AND  PC <= 0.5 → intra-modular hub
+# Z < 1.5                  → non-hub
+hub_class = {}
+for n in G_sub.nodes():
+    z = z_score.get(n, 0.0); P = P_score.get(n, 0.0)
+    if z >= Z_THRESH:
+        hub_class[n] = "INTER_HUB" if P > PC_THRESH else "INTRA_HUB"
+    else:
+        hub_class[n] = "NON_HUB"
+
+n_inter = sum(1 for v in hub_class.values() if v == "INTER_HUB")
+n_intra = sum(1 for v in hub_class.values() if v == "INTRA_HUB")
+print(f"  Intra-modular hubs (Z>={Z_THRESH}, PC<={PC_THRESH}):  {n_intra}")
+print(f"  Inter-modular hubs (Z>={Z_THRESH}, PC>{PC_THRESH}):   {n_inter}")
+print(f"  Total hubs: {n_inter + n_intra}")
+
+# DEP lookup for annotation
+dep_lookup = {row["gene"]: row for _, row in dep_df.iterrows()}
+
+
+# SAVE — Per-gene annotated CSV
+
+rows = []
+for n in G_sub.nodes():
+    gi  = g2i.get(n)
+    dep = dep_lookup.get(n, {})
+
+    if n in train_hp_set:  seed_status = "HP_train"
+    elif n in test_hp_set: seed_status = "HP_test"
+    else:                  seed_status = "candidate"
+
+    rows.append({
+        "gene":              n,
+        "seed_status":       seed_status,
+        "is_tier1":          n in t1_set,
+        "tier1_rank":        t1_genes.index(n) + 1 if n in t1_set else "",
+        "prima_bc_score":    round(float(prima_all[gi]), 5) if gi is not None else "",
+        "rwr_score":         round(float(rwr_all[gi]),   5) if gi is not None else "",
+        "mut_freq":          round(float(mut[gi]),       5) if gi is not None else "",
+        # Module
+        "module":            module_of.get(n, -1),
+        "module_size":       sizes.get(module_of.get(n, -1), 0),
+        # Hub cartography
+        "hub_class":         hub_class.get(n, "NON_HUB"),
+        "z_score":           round(z_score.get(n, 0.0), 4),
+        "participation_coef": round(P_score.get(n, 0.0), 4),
+        # Network topology
+        "degree_subnet":     int(G_sub.degree(n)),
+        "degree_full_net":   int(G_union.degree(n)) if n in G_union else 0,
+        # DEP evidence
+        "is_DEP":            bool(dep.get("is_DEP", False)),
+        "log2FC":            round(float(dep["log2FC"]), 3) if "log2FC" in dep else "",
+        "padj_FDR":          f"{dep['padj_FDR']:.2e}" if "padj_FDR" in dep else "",
+        "DEP_direction":     dep.get("direction", ""),
+        "is_dep_validated":  n in dep_indep,
+    })
+
+rows.sort(key=lambda r: (
+    0 if r["seed_status"].startswith("HP") else 1,
+    r["tier1_rank"] if r["tier1_rank"] != "" else 9999
+))
+
+ANN_CSV = OUT_DIR + "prima_bc_subnet_annotated.csv"
+with open(ANN_CSV, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+    w.writeheader(); w.writerows(rows)
+print(f"\n  Annotated CSV  → {ANN_CSV}  ({len(rows)} genes)")
+
+
+# SAVE — GraphML for Cytoscape
+
+G_out   = G_sub.copy()
+ann_map = {r["gene"]: r for r in rows}
+
+for n in G_out.nodes():
+    r = ann_map.get(n, {})
+    G_out.nodes[n]["seed_status"]        = r.get("seed_status", "")
+    G_out.nodes[n]["is_tier1"]           = int(r.get("is_tier1", False))
+    G_out.nodes[n]["tier1_rank"]         = int(r["tier1_rank"]) if r.get("tier1_rank") != "" else -1
+    G_out.nodes[n]["prima_bc_score"]     = float(r.get("prima_bc_score") or 0)
+    G_out.nodes[n]["module"]             = int(r.get("module", -1))
+    G_out.nodes[n]["module_size"]        = int(r.get("module_size", 0))
+    G_out.nodes[n]["hub_class"]          = r.get("hub_class", "NON_HUB")
+    G_out.nodes[n]["z_score"]            = float(r.get("z_score", 0))
+    G_out.nodes[n]["participation_coef"] = float(r.get("participation_coef", 0))
+    G_out.nodes[n]["degree_subnet"]      = int(r.get("degree_subnet", 0))
+    G_out.nodes[n]["is_DEP"]             = int(r.get("is_DEP", False))
+    G_out.nodes[n]["log2FC"]             = float(r.get("log2FC") or 0)
+    G_out.nodes[n]["is_dep_validated"]   = int(r.get("is_dep_validated", False))
+
+GRAPHML = OUT_DIR + "prima_bc_subnet.graphml"
+nx.write_graphml(G_out, GRAPHML)
+print(f"  GraphML        → {GRAPHML}")
+
+# SUMMARY
+
+print(f"\n{'='*68}")
+print(f"  Final Results")
+print(f"{'='*68}")
+print(f"  Auto N* (peak):      {N_star_auto}   MP={mp_star_auto:.4f}")
+print(f"  Chosen N*:           {N_CHOSEN}  MP={mp_chosen:.4f}")
+print(f"  Final candidates:    {len(t1_genes)} (DEPs within top-{N_CHOSEN})")
+print(f"  Subnetwork:          {G_sub.number_of_nodes()} nodes  "
+      f"{G_sub.number_of_edges()} edges")
+print(f"  Leiden modules:      {n_mod}  (Q={Q:.4f}, min_size={MIN_MOD_SIZE})")
+print(f"  Intra-modular hubs:  {n_intra}  (Z>={Z_THRESH}, PC<={PC_THRESH})")
+print(f"  Inter-modular hubs:  {n_inter}  (Z>={Z_THRESH}, PC>{PC_THRESH})")
+print(f"\n  Outputs saved:")
+print(f"    {MP_CSV}")
+print(f"    {PLOT_PATH}")
+print(f"    {ANN_CSV}")
+print(f"    {GRAPHML}")
