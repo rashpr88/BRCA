@@ -1,0 +1,141 @@
+# CPDB parser + network build
+import csv, sys, os, json, time, warnings
+sys.path.insert(0, "/content")
+sys.path.insert(0, "/content/drive/MyDrive/MMSE BC/")
+from itertools import combinations
+import numpy as np, networkx as nx, scipy.sparse as sp
+
+warnings.filterwarnings("ignore")
+
+CPDB_PATH = "/content/drive/MyDrive/MMSE BC/ConsensusPathDB_human_PPI"
+GML_PATH  = "/content/drive/MyDrive/MMSE BC/Copy of ppi_network_filtered_new4.gml"
+
+def parse_cpdb_ppi(path, min_sources=2, max_complex=10):
+    """
+    Parse ConsensusPathDB_human_PPI.
+
+    Column layout (tab-separated, no header):
+      0: source_databases          (comma-sep)
+      1: interaction_publications  (comma-sep PMIDs)
+      2: uniprot_entry             (comma-sep)
+      3: uniprot_id                (comma-sep)
+      4: genename                  (comma-sep)  ← USE THIS
+      5: hgnc_id
+      6: entrez_gene
+      7: ensembl_gene
+      8: interaction_confidence
+
+    Filters:
+      min_sources  ≥ 2   : exclude single-database entries (e.g. Reactome-only)
+      max_complex  ≤ 10  : exclude large complexes (ribosome/proteasome/spliceosome)
+                           which would generate thousands of spurious pairwise edges
+    """
+    edges      = set()
+    n_total    = 0
+    n_1gene    = 0
+    n_low_src  = 0
+    n_complex  = 0
+    n_kept     = 0
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 5:
+                continue
+            n_total += 1
+
+            # Count source databases
+            src_field = parts[0].strip()
+            n_src = len([s for s in src_field.split(",") if s.strip()])
+            if n_src < min_sources:
+                n_low_src += 1
+                continue
+
+            # Parse gene names
+            gene_field = parts[4].strip()
+            if not gene_field:
+                n_1gene += 1
+                continue
+            genes = [g.strip() for g in gene_field.split(",")
+                     if g.strip() and g.strip() != "NA"]
+            if len(genes) < 2:
+                n_1gene += 1
+                continue
+            if len(genes) > max_complex:
+                n_complex += 1
+                continue
+
+            # All pairwise combinations
+            for g1, g2 in combinations(genes, 2):
+                if g1 != g2:
+                    edges.add(tuple(sorted([g1, g2])))
+            n_kept += 1
+
+    print(f"  CPDB PPI parser results:")
+    print(f"    Total rows:              {n_total:>8,}")
+    print(f"    Skipped (<{min_sources} sources):    {n_low_src:>8,}")
+    print(f"    Skipped (1 gene):        {n_1gene:>8,}")
+    print(f"    Skipped (>{max_complex} genes):     {n_complex:>8,}")
+    print(f"    Rows used:               {n_kept:>8,}")
+    print(f"    Unique pairwise edges:   {len(edges):>8,}")
+    return edges
+
+# Parse CPDB
+print("Parsing CPDB PPI...")
+cpdb_edges = parse_cpdb_ppi(CPDB_PATH, min_sources=2, max_complex=10)
+
+# Load STRING edges for comparison
+print("\nLoading STRING network...")
+G_str = nx.read_gml(GML_PATH)
+str_genes = list(G_str.nodes())
+str_edges = set()
+for u, v in G_str.edges():
+    str_edges.add(tuple(sorted([str(u), str(v)])))
+print(f"  STRING: {len(str_genes)} nodes  {len(str_edges)} edges")
+
+# Build CPDB gene universe
+cpdb_gene_set = set()
+for g1, g2 in cpdb_edges:
+    cpdb_gene_set.add(g1); cpdb_gene_set.add(g2)
+cpdb_genes = sorted(cpdb_gene_set)
+str_gene_set = set(str_genes)
+
+print(f"\n  CPDB:           {len(cpdb_genes)} genes  {len(cpdb_edges)} edges")
+print(f"  STRING:         {len(str_gene_set)} genes  {len(str_edges)} edges")
+
+# Intersection and union
+common_genes = str_gene_set & cpdb_gene_set
+intersect_edges = {e for e in str_edges & cpdb_edges
+                   if e[0] in common_genes and e[1] in common_genes}
+union_genes = str_gene_set | cpdb_gene_set
+union_edges = str_edges | cpdb_edges
+
+print(f"  STRING∩CPDB:    {len(common_genes)} genes  {len(intersect_edges)} edges")
+print(f"  STRING∪CPDB:    {len(union_genes)} genes  {len(union_edges)} edges")
+
+# HP gene coverage per network
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    "benchmark", "/content/drive/MyDrive/MMSE BC/benchmark.py")
+bench = importlib.util.module_from_spec(spec); spec.loader.exec_module(bench)
+data  = bench.load_data()
+nodes = data["nodes"]
+hp_idx = np.asarray(data["hp_train"])
+y_test_full = np.asarray(data["y_test"])
+test_idx = np.asarray(data["test_idx"])
+y_t = y_test_full[test_idx]
+all_hp_genes = list(set(
+    [str(nodes[i]) for i in hp_idx] +
+    [str(nodes[i]) for i in test_idx if y_test_full[i]==1.0]
+))
+print(f"\n  Total HP genes: {len(all_hp_genes)}")
+for net_name, gene_set in [
+    ("STRING",     str_gene_set),
+    ("CPDB",       cpdb_gene_set),
+    ("STRING∩CPDB",common_genes),
+    ("STRING∪CPDB",union_genes),
+]:
+    n_hp = sum(1 for g in all_hp_genes if g in gene_set)
+    print(f"  {net_name:<16} HPs present: {n_hp}/{len(all_hp_genes)}")
