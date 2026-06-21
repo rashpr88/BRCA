@@ -101,4 +101,3 @@ with open(output_json, "w") as f:
 
 print(f"\nSaved embeddings to: {output_json}")
 
-#%%
