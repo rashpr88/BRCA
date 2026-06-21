@@ -1,0 +1,192 @@
+import torch
+import json
+import requests
+import time
+import os
+from collections import Counter
+
+# Load UniProt IDs without PDB
+
+with open("missing_uniprot_ids.json", "r") as f:
+    missing_pdb_ids = json.load(f)
+
+print(f"Proteins without PDB: {len(missing_pdb_ids)}")
+
+
+# Load AlphaFold downloaded mapping
+
+alphafold_dir = "./alphafold_structures_biopython"
+mapping_file = os.path.join(alphafold_dir, "alphafold_downloaded_biopython.json")
+
+with open(mapping_file, "r") as f:
+    alphafold_ids = json.load(f)
+
+print(f"Proteins with AlphaFold structures: {len(alphafold_ids)}")
+
+
+# Subtract AlphaFold IDs from missing PDB IDs
+
+no_structure_ids = [uid for uid in missing_pdb_ids if uid not in alphafold_ids]
+print(f"Proteins without any structure (PDB or AlphaFold): {len(no_structure_ids)}")
+
+
+# Save IDs without any structure
+output_file = "uniprot_ids_no_structure.json"
+with open(output_file, "w") as f:
+    json.dump(no_structure_ids, f, indent=2)
+
+print(f"Saved UniProt IDs without any structure to: {output_file}")
+
+
+# Load all UniProt IDs from embeddings
+
+embeddings_json = "prott5_embeddings.json"
+with open(embeddings_json, "r") as f:
+    embeddings = json.load(f)
+
+all_uniprot_ids = list(embeddings.keys())
+print(f"Total UniProt IDs in embeddings: {len(all_uniprot_ids)}")
+
+# Load UniProt IDs without any structure
+
+with open("uniprot_ids_no_structure.json", "r") as f:
+    no_structure_ids = json.load(f)
+
+# Keep only IDs that have at least one structure
+ids_with_structure = [uid for uid in all_uniprot_ids if uid not in no_structure_ids]
+print(f"Proteins with structure (PDB or AlphaFold): {len(ids_with_structure)}")
+
+# Save to JSON
+output_file = "uniprot_ids_with_structure.json"
+with open(output_file, "w") as f:
+    json.dump(ids_with_structure, f, indent=2)
+
+print(f"Saved proteins with structure to: {output_file}")
+
+
+# Config
+
+go_bp_output_file = "uniprot_go_all.json"
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# Load UniProt IDs with structures
+
+with open("uniprot_ids_with_structure.json", "r") as f:
+    uniprot_ids = json.load(f)
+
+print(f"Total proteins with structure: {len(uniprot_ids)}")
+
+# Function: Fetch GO BP IDs from QuickGO
+
+def get_quickgo_go_bp_ids(uniprot_id):
+    url = "https://www.ebi.ac.uk/QuickGO/services/annotation/search"
+    params = {
+        "geneProductId": f"UniProtKB:{uniprot_id}",
+        "aspect": "biological_process,molecular_function,cellular_component",
+        "limit": 200  # QuickGO max
+    }
+    headers = {"Accept": "application/json"}
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        if r.status_code != 200:
+            print(f"{uniprot_id} -> Error {r.status_code}")
+            return []
+        data = r.json()
+    except Exception as e:
+        print(f"{uniprot_id} -> Exception: {e}")
+        return []
+
+    go_bp_ids = []
+    for item in data.get("results", []):
+        evidence = item.get("evidenceCode")
+        if evidence not in ("IEA", "ECO:0007322"):
+            go_bp_ids.append(item.get("goId"))
+
+    return list(set(go_bp_ids))  # Remove duplicates
+
+# Fetch GO BP for all proteins
+all_go_bp = {}
+for i, uid in enumerate(uniprot_ids, 1):
+    go_ids = get_quickgo_go_bp_ids(uid)
+    all_go_bp[uid] = go_ids
+    print(f"[{i}/{len(uniprot_ids)}] {uid}: {len(go_ids)} BP terms")
+    time.sleep(0.2)  # polite delay
+
+# Save to JSON
+with open(go_bp_output_file, "w") as f:
+    json.dump(all_go_bp, f, indent=2)
+
+print(f"\nGO BP IDs saved for {len(all_go_bp)} proteins -> {go_bp_output_file}")
+
+# Load UniProt → GO-BP mapping
+
+go_bp_file = "uniprot_go_all.json"
+
+with open(go_bp_file, "r") as f:
+    uniprot_go_bp = json.load(f)
+
+# Count proteins with non-empty GO-BP annotations
+proteins_with_go = sum(1 for go_terms in uniprot_go_bp.values() if go_terms)
+
+print(f"Total proteins: {len(uniprot_go_bp)}")
+print(f"Proteins with GO-BP annotations: {proteins_with_go}")
+print(f"Proteins without GO-BP annotations: {len(uniprot_go_bp) - proteins_with_go}")
+print(f"Percentage with annotations: {proteins_with_go/len(uniprot_go_bp)*100:.2f}%")
+
+
+#  Count GO-BP term frequencies
+go_counter = Counter()
+
+for go_terms in uniprot_go_bp.values():
+    unique_terms = set(go_terms)
+    go_counter.update(unique_terms)
+
+print(f"Total unique GO-BP terms: {len(go_counter)}")
+
+
+# Keep GO-BP terms occurring ≥ 500 times
+MIN_COUNT = 500
+
+selected_go_terms = sorted([
+    go for go, count in go_counter.items()
+    if count >= MIN_COUNT
+])
+
+print(f"GO-BP terms occurring ≥ {MIN_COUNT}: {len(selected_go_terms)}")
+
+# Build GO-BP index
+go_to_index = {go: idx for idx, go in enumerate(selected_go_terms)}
+num_go_terms = len(go_to_index)
+
+print(f"Final GO-BP one-hot dimension: {num_go_terms}")
+
+# One-hot encode per UniProt ID
+import numpy as np
+
+uniprot_go_onehot = {}
+
+for uniprot_id, go_terms in uniprot_go_bp.items():
+    vector = np.zeros(num_go_terms, dtype=int)
+
+    for go in set(go_terms):
+        if go in go_to_index:
+            vector[go_to_index[go]] = 1
+
+    uniprot_go_onehot[uniprot_id] = vector.tolist()
+
+go_vocab_file = "go_bp_vocab.json"
+
+with open(go_vocab_file, "w") as f:
+    json.dump(go_to_index, f, indent=2)
+
+onehot_file = "uniprot_go_bp_binary.json"
+
+with open(onehot_file, "w") as f:
+    json.dump(uniprot_go_onehot, f)
+
+print("Saved GO-BP one-hot encodings")
+
+
+#%%
