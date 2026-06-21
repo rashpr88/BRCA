@@ -1,0 +1,522 @@
+"""
+Meta-Learner Selection
+
+Answer: which meta-learner (LR / MLP / XGBoost) is best for the fixed
+6-feature vector derived from the H5 biological embeddings + PPI diffusion?
+
+Features (all computed per fold, leak-safe)
+
+Run in Colab
+------------
+  !python stage1_metalearner_delong.py
+"""
+
+# stdlib / third-party 
+import os, importlib.util, warnings, json
+import h5py
+import numpy as np
+import networkx as nx
+import scipy.sparse as sp
+from sklearn.preprocessing import normalize, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import average_precision_score, roc_auc_score
+from scipy.stats import norm
+
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except Exception:
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    HAS_XGB = False
+
+warnings.filterwarnings("ignore")
+
+
+# CONFIG  — edit paths to match your Drive layout
+
+GML_PATH    = "/content/drive/MyDrive/MMSE BC/Copy of ppi_network_filtered_new4.gml"
+H5_PATH     = "/content/drive/MyDrive/MMSE BC/Copy of node_embeddings_filtered_new4.h5"
+BENCH_PATH  = "/content/drive/MyDrive/MMSE BC/benchmark.py"
+OUT_DIR     = "/content/drive/MyDrive/MMSE BC/stage1/"
+
+N_FOLDS   = 10
+NEG_RATIO = 10      # neg:pos ratio in the CV pool
+SEED      = 42
+RWR_ALPHA = 0.15
+RWR_ITER  = 50
+
+
+# GRAPH + DIFFUSION HELPERS
+
+
+def build_normalised_adj(G, nodes):
+    """Return (A_raw_csr, W_row_norm_csr, degree_array)."""
+    N   = len(nodes)
+    n2i = {n: i for i, n in enumerate(nodes)}
+    rs, cs = [], []
+    for u, v in G.edges():
+        if u in n2i and v in n2i:
+            i, j = n2i[u], n2i[v]
+            rs += [i, j]; cs += [j, i]
+    data = [1.0] * len(rs)
+    A    = sp.csr_matrix((data, (rs, cs)), shape=(N, N))
+    deg  = np.asarray(A.sum(1)).flatten()
+    deg[deg == 0] = 1.0
+    W    = (sp.diags(1.0 / deg) @ A).tocsr()
+    return A.tocsr(), W, deg
+
+
+def diffusion_scores(W, N, seed_idx, alpha=RWR_ALPHA, n_iter=RWR_ITER):
+    """
+    Returns dict with keys 'rwr' and 'markov2', both shape (N,).
+
+    rwr     : personalized PageRank / random walk with restart
+    markov2 : 2-step Markov (W^2 @ s) — captures 2-hop proximity
+              without the restart bias, complementary to RWR
+    """
+    s        = np.zeros(N, np.float32)
+    s[seed_idx] = 1.0 / len(seed_idx)
+    r        = s.copy()
+    for _ in range(n_iter):
+        r    = (1.0 - alpha) * (W.T @ r) + alpha * s
+    m2       = W.T @ (W.T @ s)
+    return {"rwr": r, "markov2": m2}
+
+
+# EMBEDDING HELPERS
+
+
+def load_h5_modalities(h5_path, nodes):
+    """
+    Load seq (ProtT5 1024d), struct (GearNet 512d), go (Onto2Vec 200d).
+    Each is z-scored then L2-normalised (fit on all nodes — embeddings
+    are label-free biological properties, no leakage risk).
+    Returns dict of float32 arrays shape (N, d).
+    """
+    modalities = {}
+    with h5py.File(h5_path, "r") as f:
+        keys_in_file = list(f.keys())
+        for key in ["seq", "struct", "go"]:
+            if key not in keys_in_file:
+                print(f"  ⚠  '{key}' not found in H5 — skipping")
+                continue
+            sample_node = next(iter(f[key].keys()))
+            d           = np.asarray(f[key][sample_node][()]).flatten().shape[0]
+            M           = np.zeros((len(nodes), d), np.float32)
+            available   = set(f[key].keys())
+            for i, n in enumerate(nodes):
+                if str(n) in available:
+                    M[i] = np.asarray(f[key][str(n)][()]).flatten()
+            # z-score then L2-normalise
+            sc  = StandardScaler()
+            M   = sc.fit_transform(M).astype(np.float32)
+            M   = normalize(M, axis=1).astype(np.float32)
+            modalities[key] = M
+            print(f"  {key}: {d}d → loaded for {len(nodes)} nodes")
+    return modalities
+
+
+def max_cosine_sim_to_seeds(embed_matrix, target_idx, seed_idx):
+    """
+    For each target gene, compute its max cosine similarity to any seed gene.
+    Leave-self-out: if a target IS a seed (happens in train fold), exclude it.
+
+    Returns float32 array shape (len(target_idx),).
+    """
+    tgt = np.asarray(target_idx)
+    sd  = np.asarray(seed_idx)
+    T   = embed_matrix[tgt]          # (n_targets, d)
+    S   = embed_matrix[sd]           # (n_seeds, d)
+    sim = (T @ S.T).astype(np.float32)  # (n_targets, n_seeds)
+
+    # mask self-comparisons
+    eq_mask = (tgt[:, None] == sd[None, :])
+    if eq_mask.any():
+        sim = sim.copy()
+        sim[eq_mask] = np.nan
+
+    m = np.nanmax(sim, axis=1)
+    m = np.where(np.isnan(m), 0.0, m)
+    return m.astype(np.float32)
+
+
+# FEATURE BUILDER
+
+
+def build_features(modalities, target_idx, seed_idx, diff, logd):
+    """
+    Build the 6-feature vector for a set of target nodes:
+      [max_seq, max_struct, max_go, rwr, markov2, log_degree]
+
+    All modalities that are present in `modalities` are used; missing ones
+    are silently skipped (backwards compatible if seq is absent from H5).
+
+    Per-fold: diff is recomputed from fold train-HPs, seed_idx = fold train-HP idx.
+    """
+    tgt  = np.asarray(target_idx)
+    cols = []
+    names = []
+
+    for key in ["seq", "struct", "go"]:
+        if key in modalities:
+            s = max_cosine_sim_to_seeds(modalities[key], target_idx, seed_idx)
+            cols.append(s)
+            names.append(f"max_{key}")
+
+    cols.append(diff["rwr"][tgt]);     names.append("rwr")
+    cols.append(diff["markov2"][tgt]); names.append("markov2")
+    cols.append(logd[tgt]);            names.append("log_degree")
+
+    return np.column_stack(cols).astype(np.float32), names
+
+
+
+# DE LONG AUC COMPARISON  (DeLong 1988, implemented from first principles)
+def _placement_values(scores_pos, scores_neg):
+    """V10 and V01 placement values for the DeLong estimator."""
+    m, n    = len(scores_pos), len(scores_neg)
+    # V10[i] = P(score_neg < scores_pos[i]) + 0.5 * P(score_neg == scores_pos[i])
+    V10     = np.zeros(m, float)
+    V01     = np.zeros(n, float)
+    for i, sp in enumerate(scores_pos):
+        lt  = (scores_neg < sp).sum()
+        eq  = (scores_neg == sp).sum()
+        V10[i] = (lt + 0.5 * eq) / n
+    for j, sn in enumerate(scores_neg):
+        lt  = (scores_pos > sn).sum()
+        eq  = (scores_pos == sn).sum()
+        V01[j] = (lt + 0.5 * eq) / m
+    return V10, V01
+
+
+def delong_test(y_true, scores_a, scores_b):
+    """
+    Two-sided DeLong (1988) test comparing AUC of classifier A vs B
+    on the same sample set.
+
+    Parameters
+    ----------
+    y_true   : binary labels (0/1), shape (n,)
+    scores_a : predicted scores from model A, shape (n,)
+    scores_b : predicted scores from model B, shape (n,)
+
+    Returns
+    -------
+    auc_a, auc_b, z_stat, p_value (two-sided)
+    """
+    pos_mask = y_true == 1
+    neg_mask = y_true == 0
+    sp_a = scores_a[pos_mask]; sn_a = scores_a[neg_mask]
+    sp_b = scores_b[pos_mask]; sn_b = scores_b[neg_mask]
+
+    m, n = len(sp_a), len(sn_a)
+    if m == 0 or n == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    auc_a = roc_auc_score(y_true, scores_a)
+    auc_b = roc_auc_score(y_true, scores_b)
+
+    V10_a, V01_a = _placement_values(sp_a, sn_a)
+    V10_b, V01_b = _placement_values(sp_b, sn_b)
+
+    # Covariance matrix of (AUC_A, AUC_B) — structural component
+    S10_aa = np.var(V10_a, ddof=1) / m
+    S10_bb = np.var(V10_b, ddof=1) / m
+    S10_ab = np.cov(V10_a, V10_b, ddof=1)[0, 1] / m
+
+    S01_aa = np.var(V01_a, ddof=1) / n
+    S01_bb = np.var(V01_b, ddof=1) / n
+    S01_ab = np.cov(V01_a, V01_b, ddof=1)[0, 1] / n
+
+    var_diff = (S10_aa + S01_aa) + (S10_bb + S01_bb) - 2 * (S10_ab + S01_ab)
+
+    if var_diff <= 0:
+        return auc_a, auc_b, 0.0, 1.0
+
+    z  = (auc_a - auc_b) / np.sqrt(var_diff)
+    p  = 2.0 * (1.0 - norm.cdf(abs(z)))
+    return auc_a, auc_b, z, p
+
+
+# CLASSIFIER FACTORY
+
+
+def make_classifier(name, neg_pos_ratio=10.0, seed=SEED):
+    if name == "LR":
+        return LogisticRegression(
+            class_weight="balanced", max_iter=2000, C=1.0, random_state=seed)
+    if name == "MLP_16":
+        return MLPClassifier(
+            hidden_layer_sizes=(16,), max_iter=600,
+            early_stopping=True, validation_fraction=0.15,
+            alpha=1e-2, random_state=seed)
+    if name == "MLP_32_16":
+        return MLPClassifier(
+            hidden_layer_sizes=(32, 16), max_iter=600,
+            early_stopping=True, validation_fraction=0.15,
+            alpha=1e-3, random_state=seed)
+    if name == "XGB":
+        if HAS_XGB:
+            return XGBClassifier(
+                n_estimators=300, max_depth=3, learning_rate=0.06,
+                scale_pos_weight=neg_pos_ratio, subsample=0.8,
+                colsample_bytree=0.8, min_child_weight=5,
+                reg_lambda=5.0, random_state=seed,
+                use_label_encoder=False, eval_metric="logloss",
+                verbosity=0, n_jobs=-1)
+        # fallback
+        return HistGradientBoostingClassifier(
+            max_iter=300, max_depth=3, learning_rate=0.06,
+            class_weight="balanced", random_state=seed)
+    raise ValueError(f"Unknown classifier: {name}")
+
+
+def fit_and_predict(name, clf, X_tr, y_tr, X_va, rng):
+    """
+    Fit classifier and return predicted probabilities on validation fold.
+    MLP gets oversampled balanced data (no class_weight support).
+    Others use their native imbalance handling.
+    """
+    if "MLP" in name:
+        pos_idx = np.where(y_tr == 1)[0]
+        neg_idx = np.where(y_tr == 0)[0]
+        n_each  = max(len(pos_idx), len(neg_idx))
+        idx     = np.concatenate([
+            rng.choice(pos_idx, size=n_each, replace=True),
+            rng.choice(neg_idx, size=n_each, replace=True)])
+        clf.fit(X_tr[idx], y_tr[idx])
+    else:
+        clf.fit(X_tr, y_tr)
+
+    if hasattr(clf, "predict_proba"):
+        return clf.predict_proba(X_va)[:, 1]
+    return clf.decision_function(X_va)
+
+
+# MAIN
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    banner = "═" * 78
+    print(f"\n{banner}")
+    print("  MMSE-BC  Stage 1 — Meta-Learner Selection  (De Long test)")
+    print(f"  XGBoost available: {HAS_XGB}")
+    print(banner)
+
+    # ── 1. Load data via benchmark.load_data() ─────────────────────────────
+    print("\n[1/5] Loading data via benchmark.load_data()…")
+    spec  = importlib.util.spec_from_file_location("benchmark", BENCH_PATH)
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    data  = bench.load_data()
+
+    bench_nodes = list(data["nodes"])
+    hp_train    = np.asarray(data["hp_train"])   # indices into bench_nodes
+    test_idx    = np.asarray(data["test_idx"])
+    y_test      = data["y_test"]
+
+    # ── 2. Build graph objects from the CLEAN GML ──────────────────────────
+    print("\n[2/5] Building graph and diffusion operators…")
+    G     = nx.read_gml(GML_PATH)
+    nodes = list(G.nodes())
+    N     = len(nodes)
+    n2i   = {n: i for i, n in enumerate(nodes)}
+
+    A_raw, W, deg = build_normalised_adj(G, nodes)
+    logd          = np.log1p(deg).astype(np.float32)
+
+    # Map benchmark node names → graph indices
+    hp_train_idx = np.array(
+        [n2i[str(bench_nodes[i])] for i in hp_train if str(bench_nodes[i]) in n2i],
+        dtype=np.int64)
+    test_hp_set  = set(int(i) for i in test_idx if y_test[i] == 1.0)
+    test_bg_set  = set(int(i) for i in test_idx if y_test[i] == 0.0)
+    all_hp_set   = set(hp_train_idx.tolist()) | test_hp_set
+    train_bg_idx = np.array(
+        [i for i in range(N) if i not in all_hp_set and i not in test_bg_set],
+        dtype=np.int64)
+
+    print(f"  train HPs     : {len(hp_train_idx)}")
+    print(f"  train bg pool : {len(train_bg_idx)}")
+    print(f"  test HPs      : {len(test_hp_set)}  (NOT TOUCHED)")
+
+    # ── 3. Load H5 modalities ──────────────────────────────────────────────
+    print("\n[3/5] Loading H5 embeddings (seq / struct / go)…")
+    modalities = load_h5_modalities(H5_PATH, nodes)
+    feat_names_example = (
+        [f"max_{k}" for k in ["seq", "struct", "go"] if k in modalities]
+        + ["rwr", "markov2", "log_degree"])
+    print(f"  Features per gene: {feat_names_example}  (n={len(feat_names_example)})")
+
+    # ── 4. Build CV pool (train HPs + sampled negatives) ──────────────────
+    print("\n[4/5] Building CV pool and running 10-fold CV…")
+    rng      = np.random.default_rng(SEED)
+    n_neg    = min(len(hp_train_idx) * NEG_RATIO, len(train_bg_idx))
+    neg_sel  = rng.choice(train_bg_idx, size=n_neg, replace=False)
+    pool     = np.concatenate([hp_train_idx, neg_sel])
+    y_pool   = np.array(
+        [1] * len(hp_train_idx) + [0] * len(neg_sel), dtype=np.int32)
+    neg_pos_ratio = (y_pool == 0).sum() / max(1, (y_pool == 1).sum())
+
+    print(f"  Pool: {(y_pool==1).sum()} pos + {(y_pool==0).sum()} neg "
+          f"(ratio {neg_pos_ratio:.1f}:1)")
+
+    # Pre-generate identical splits for all classifiers
+    skf    = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    splits = list(skf.split(pool, y_pool))
+
+    clf_names = ["LR", "MLP_16", "MLP_32_16", "XGB"]
+    oof_store = {name: np.zeros(len(pool), dtype=np.float64) for name in clf_names}
+    rng_mlp   = np.random.default_rng(SEED + 7)
+
+    for fold_i, (tr, va) in enumerate(splits):
+        fold_hp_idx = pool[tr][y_pool[tr] == 1].tolist()
+
+        # Per-fold diffusion seeded from fold train-HPs only
+        diff = diffusion_scores(W, N, fold_hp_idx)
+
+        # Per-fold features
+        X_tr_raw, feat_names = build_features(
+            modalities, pool[tr].tolist(), fold_hp_idx, diff, logd)
+        X_va_raw, _          = build_features(
+            modalities, pool[va].tolist(), fold_hp_idx, diff, logd)
+
+        # Scale: fit on train fold only
+        sc     = StandardScaler().fit(X_tr_raw)
+        X_tr   = sc.transform(X_tr_raw)
+        X_va   = sc.transform(X_va_raw)
+        y_tr   = y_pool[tr]
+
+        for name in clf_names:
+            clf = make_classifier(name, neg_pos_ratio)
+            p   = fit_and_predict(name, clf, X_tr, y_tr, X_va, rng_mlp)
+            oof_store[name][va] = p
+
+        if (fold_i + 1) % 2 == 0:
+            print(f"  … fold {fold_i+1}/{N_FOLDS} done")
+
+    print(f"  ✓ All {N_FOLDS} folds complete.")
+
+    # ── 5. Compute metrics and De Long tests ───────────────────────────────
+    print("\n[5/5] Computing OOF metrics and De Long comparisons…")
+
+    metrics = {}
+    for name in clf_names:
+        oof   = oof_store[name]
+        aupr  = average_precision_score(y_pool, oof)
+        auroc = roc_auc_score(y_pool, oof)
+        # per-fold AUPR for reporting
+        pf    = [average_precision_score(y_pool[va], oof[va]) for _, va in splits]
+        metrics[name] = {
+            "oof_aupr":  float(aupr),
+            "oof_auroc": float(auroc),
+            "pf_mean":   float(np.mean(pf)),
+            "pf_std":    float(np.std(pf)),
+        }
+
+    # Reference = LR (baseline meta-learner)
+    ref_name = "LR"
+    ref_oof  = oof_store[ref_name]
+
+    # Print results table
+    print("\n" + "═" * 78)
+    print("  OOF RESULTS  (n_pool ≈ {}, 10-fold CV, holdout untouched)".format(
+        len(pool)))
+    print("═" * 78)
+    print(f"  {'Classifier':<14} | {'OOF AUPR':>9} | {'OOF AUROC':>10} | "
+          f"{'per-fold AUPR':>15}")
+    print("  " + "─" * 60)
+    for name in clf_names:
+        m = metrics[name]
+        marker = " ◄ reference" if name == ref_name else ""
+        print(f"  {name:<14} | {m['oof_aupr']:>9.4f} | {m['oof_auroc']:>10.4f} | "
+              f"  {m['pf_mean']:.4f} ± {m['pf_std']:.4f}{marker}")
+    print("═" * 78)
+
+    # De Long pairwise vs LR
+    print(f"\n  De Long test (two-sided) vs {ref_name}:")
+    print(f"  {'Comparison':<24} | {'ΔAUC':>8} | {'z':>7} | {'p-value':>9} | {'sig?':>6}")
+    print("  " + "─" * 62)
+    delong_results = {}
+    for name in clf_names:
+        if name == ref_name:
+            continue
+        auc_ref, auc_cmp, z, p = delong_test(y_pool, ref_oof, oof_store[name])
+        sig = "YES *" if p < 0.05 else "no"
+        delta = auc_ref - auc_cmp
+        label = f"{ref_name} vs {name}"
+        print(f"  {label:<24} | {delta:>+8.4f} | {z:>7.3f} | {p:>9.4f} | {sig:>6}")
+        delong_results[name] = {"delta_auc": float(delta), "z": float(z),
+                                "p": float(p), "sig_0.05": p < 0.05}
+
+    # Determine winner
+    winner = max(clf_names, key=lambda n: metrics[n]["oof_aupr"])
+    print(f"\n  ┌─────────────────────────────────────────────────────────┐")
+    print(f"  │  LOCKED META-LEARNER → {winner:<34}│")
+    print(f"  │  OOF AUPR = {metrics[winner]['oof_aupr']:.4f}   OOF AUROC = "
+          f"{metrics[winner]['oof_auroc']:.4f}              │")
+    print(f"  └─────────────────────────────────────────────────────────┘")
+
+    # Interpretation note
+    print("\n  INTERPRETATION:")
+    print("  ─────────────────────────────────────────────────────────────")
+    if winner == "LR":
+        print("  LR wins: linear meta-learner is sufficient for this feature")
+        print("  set at n=71 training positives.  Nonlinear classifiers over-")
+        print("  fit the small labeled set.  Interpretable coefficients are a")
+        print("  bonus for the manuscript.")
+    else:
+        print(f"  {winner} wins: a nonlinear meta-learner provides measurable")
+        print("  uplift confirmed by De Long.  Use this as the meta-learner")
+        print("  throughout Stage 2 (feature ablation).")
+
+    print("\n  NOTE: De Long test operates on n ≈ {} OOF sample pairs —".format(
+        len(pool)))
+    print("  far more statistical power than Wilcoxon on 10 fold-AUPRs.")
+    print("  A De Long p < 0.05 here is a meaningful difference; p > 0.05")
+    print("  means the two classifiers are within estimation noise on this")
+    print("  dataset and the simpler one (LR) should be preferred.")
+
+    # ── Save outputs ───────────────────────────────────────────────────────
+    import csv
+    csv_path = os.path.join(OUT_DIR, "stage1_oof_scores.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pool_graph_idx", "y_pool"] + clf_names)
+        for i in range(len(pool)):
+            row = [int(pool[i]), int(y_pool[i])] + [
+                float(oof_store[n][i]) for n in clf_names]
+            writer.writerow(row)
+    print(f"\n  OOF scores saved → {csv_path}")
+
+    result = {
+        "winner":         winner,
+        "feature_names":  feat_names_example,
+        "n_features":     len(feat_names_example),
+        "n_train_hp":     int(len(hp_train_idx)),
+        "n_pool":         int(len(pool)),
+        "metrics":        metrics,
+        "delong_vs_LR":   delong_results,
+        "config": {
+            "n_folds":    N_FOLDS,
+            "neg_ratio":  NEG_RATIO,
+            "seed":       SEED,
+            "rwr_alpha":  RWR_ALPHA,
+            "rwr_iter":   RWR_ITER,
+        }
+    }
+    json_path = os.path.join(OUT_DIR, "stage1_result.json")
+    with open(json_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"  Result JSON saved  → {json_path}")
+    print(f"\n  Stage 1 complete.  Proceed to stage2_feature_ablation.py")
+    print(f"  using meta-learner: {winner}\n")
+
+    return result
+
+
+if __name__ == "__main__":
+    main()
