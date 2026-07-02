@@ -7,7 +7,7 @@ This repository accompanies the manuscript *"A parsimonious positive-unlabelled 
 
 ## Overview
 
-SeqNetMut evaluates which molecular data modalities genuinely improve breast-cancer gene prioritisation under a positive-unlabelled (PU) learning protocol, and whether conclusions generalise across PPI network configurations (STRING, CPDB, and their union/intersection). The pipeline runs in eight sequential stages — feature engineering, meta-learner selection, feature ablation, multi-network evaluation, holdout benchmarking, genome-wide candidate prediction, subnetwork/hub analysis, and biological validation — summarised in `Pipeline.png`.
+SeqNetMut evaluates which molecular data modalities genuinely improve breast-cancer gene prioritisation under a positive-unlabelled (PU) learning protocol, and whether conclusions generalise across PPI network configurations (STRING, CPDB, and their union/intersection). The pipeline runs in eight sequential stages: feature engineering, meta-learner selection, feature ablation, multi-network evaluation, holdout benchmarking, genome-wide candidate prediction, subnetwork/hub analysis, and biological validation.
 
 ---
 
