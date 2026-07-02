@@ -13,7 +13,7 @@ SeqNetMut evaluates which molecular data modalities genuinely improve breast-can
 
 ## Repository structure
 
-The repository is organised by pipeline stage rather than by file type — each folder corresponds to one stage (or a closely related pair of stages) in the manuscript's Section 3 workflow.
+The repository is organised by pipeline stage rather than by file type. Each folder corresponds to one stage (or a closely related pair of stages) in the manuscript's Section 3 workflow.
 
 | Folder / file | Stage(s) | Contents |
 |---|---|---|
@@ -23,7 +23,7 @@ The repository is organised by pipeline stage rather than by file type — each 
 | `GO-BP/` | 1, 8 | QuickGO annotation retrieval per UniProt ID and GO Biological Process feature preparation; also used downstream for enrichment analysis of final candidates. |
 | `getAnnotations_GO-BP(onto2vec).pl` | 1 | Onto2Vec-style GO annotation pipeline: extracts GO classes, filters non-experimental evidence codes (excludes IEA/ND), and propagates annotations up the ontology hierarchy (true-path rule) to build the ancestor-augmented GO feature set. |
 | `Networks_build/` | 1, 4 | Parses STRING v11 and ConsensusPathDB v35, and constructs the four PPI network configurations (STRING, CPDB, STRING∩CPDB, STRING∪CPDB) used for cross-network robustness evaluation. |
-| `Meta_leaner/` | 2 | Meta-learner selection: compares candidate classifiers (e.g. logistic regression vs. tree-based alternatives) to fix the downstream model architecture before ablation. |
+| `Meta_leaner/` | 2 | Meta-learner selection: compares candidate classifiers (e.g., logistic regression vs. tree-based alternatives) to fix the downstream model architecture before ablation. |
 | `Feature_Network_ablation/` | 3, 4 | Systematic feature ablation (20 configurations, 20×10-fold repeated undersampling cross-validation) and multi-network robustness checks, identifying seq + rwr + mut as the optimal combination. |
 | `Benchmark/` | 5 | Holdout benchmarking against classical topology baselines (RWR, LocalNbr, Node2Vec+XGBoost, feature-only RF) and GNN baselines (EMOGI-style GCN, GAT) on the **fixed holdout split** (`seed=2024`, 17 HP test genes) shared with the main pipeline. |
 | `MP_Hubs/` | 6, 7 | Genome-wide candidate scoring, modified-precision cutoff selection against TCGA-BRCA DEGs, Leiden community detection, and hub cartography (z-score / participation coefficient classification). |
