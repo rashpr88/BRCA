@@ -21,6 +21,8 @@ distribution of top-100 overlap under the null.
 import numpy as np
 import networkx as nx
 import scipy.sparse as sp
+import csv
+from collections import Counter
 from collections import defaultdict
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -265,7 +267,6 @@ def run(genes, G, W, deg, mods, omics, train_hp, all_hp_idx,
           f"± {ov_null.std():.1f} genes (max {ov_null.max()})")
     print("=" * 62)
 
-    import csv
     with open(OUT_CSV, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader(); w.writerows(rows)
@@ -283,9 +284,7 @@ run_permutation = run
 
 
 
-
-from collections import Counter
-import csv
+# gene recovery frequency analysis with CSV output
 
 N = len(r["genes"])
 bin_of    = build_degree_bins(NETWORKS["STRING∪CPDB"]["deg"])
