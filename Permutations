@@ -280,3 +280,45 @@ run_permutation = run
 #     mods=mods, omics=omics,
 #     train_hp=train_hp, all_hp_idx=all_hp_set,
 #     real_top100_genes=top100_genes)
+
+
+
+
+from collections import Counter
+import csv
+
+N = len(r["genes"])
+bin_of    = build_degree_bins(NETWORKS["STRING∪CPDB"]["deg"])
+mods, omx = get_network_arrays(r["genes"])
+W         = NETWORKS["STRING∪CPDB"]["W"]
+all_hp    = set(r["train_hp"].tolist()) | set(r["test_hp"].tolist())
+real_top  = set(top100_genes)
+
+hits = Counter()
+for p in range(99):
+    rng = np.random.default_rng(10_000 + p)          # same seeds as before
+    perm_seeds = degree_matched_sample(bin_of, r["train_hp"], all_hp, rng)
+    bg = np.array([i for i in range(N)
+                   if i not in all_hp and i not in set(perm_seeds.tolist())],
+                  dtype=np.int64)
+    top = genome_wide_top_n(W, N, perm_seeds, bg, mods, omx)
+    for g in (r["genes"][i] for i in top):
+        if g in real_top:
+            hits[g] += 1
+    if (p + 1) % 20 == 0:
+        print(f"{p+1}/99")
+
+freq = {g: hits.get(g, 0) / 99 for g in top100_genes}
+
+print("mean genes recovered per permutation:", round(sum(hits.values()) / 99, 1))
+
+with open("/content/drive/MyDrive/MMSE BC (1)/perm_recovery_freq.csv", "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["gene", "perm_recovery_freq"])
+    for g in top100_genes:
+        w.writerow([g, round(freq[g], 3)])
+
+print("\nnever recovered (seed-specific):",
+      sorted(g for g in top100_genes if freq[g] == 0))
+print("\nrecovered in >50% of permutations:",
+      sorted((g for g in top100_genes if freq[g] > 0.5),
+             key=lambda g: -freq[g]))
