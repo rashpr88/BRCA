@@ -148,7 +148,7 @@ def load_data() -> dict:
     unlabeled_idx = np.setdiff1d(np.where(y == 0.0)[0], neg_idx)
     print(f"  HP={len(hp_idx)}  NEG={len(neg_idx)}  U={len(unlabeled_idx)}")
 
-    # ── Fixed test split ─────────────────────────────────────────
+    # ── Fixed test split ──
     hp_perm = np.random.RandomState(CFG["HP_TEST_SEED"]).permutation(hp_idx)
     n_hp_test = max(1, int(CFG["HP_TEST_FRAC"] * len(hp_idx)))
     hp_test, hp_train = hp_perm[:n_hp_test], hp_perm[n_hp_test:]
@@ -177,7 +177,7 @@ def load_data() -> dict:
           f"NEG test={len(neg_test)} | Test={len(test_idx)} | Train={len(train_idx)}")
 
     # ── Embeddings: seq (ProtT5) + struct + go ──────────────────────
-    print("📂 Loading modality embeddings…")
+    print("Loading modality embeddings…")
     mods = {}
     with h5py.File(CFG["h5_path"], "r") as f:
         for key in ["seq", "struct", "go"]:
@@ -212,7 +212,7 @@ def load_data() -> dict:
         omics[k] = ((v - mu) / max(sd, 1e-9)).astype(np.float32)
 
     # ── Full PPI feature stack (struct+N2V+RWR-PPMI+NetMF), cached ──
-    print("📂 Building PPI feature stack…")
+    print(" Building PPI feature stack…")
     ppi_X, n2v_X = _load_ppi_feature_stack(G, nodes)
 
     def _scale(X):
