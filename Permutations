@@ -1,0 +1,282 @@
+"""
+Tests whether SeqNetMut's performance and biological output are specific to
+the curated breast-cancer seed set, or reproducible with any degree-matched
+random gene set of the same size.
+
+For each of N_PERM permutations:
+  1. Sample 71 random genes degree-matched to the 71 real training seeds
+  2. Recompute RWR and max_seq from the permuted seeds (mut is unchanged)
+  3. Measure CV AUPR (seed-recovery performance)
+  4. Score genome-wide, take top-100 candidates
+  5. Build induced subgraph of top-100, run Leiden, record modularity Q
+  6. Record overlap with the REAL top-100 candidate list
+
+Outputs empirical two-sided p-values for CV AUPR and modularity, plus the
+distribution of top-100 overlap under the null.
+
+
+"""
+!pip install leidenalg igraph -q
+
+import numpy as np
+import networkx as nx
+import scipy.sparse as sp
+from collections import defaultdict
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import average_precision_score
+
+import leidenalg
+import igraph as ig
+
+# ─────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────
+N_PERM       = 50      # permutations
+N_REPEATS_CV = 5       # fewer than the main pipeline's 20, for tractability
+N_FOLDS      = 10
+NEG_RATIO    = 10
+BASE_SEED    = 2024
+TOP_N        = 100
+N_DEG_BINS   = 20
+LEIDEN_GAMMA = 1.0
+MIN_MOD_SIZE = 6
+LOCKED       = ["max_seq", "rwr", "mut"]
+
+OUT_CSV = "/content/drive/MyDrive/MMSE BC (1)/permutation_results.csv"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DEGREE-MATCHED SAMPLING
+# ─────────────────────────────────────────────────────────────────────
+
+def build_degree_bins(deg, n_bins=N_DEG_BINS):
+    """Assign every gene to a log-degree quantile bin."""
+    logd = np.log1p(deg)
+    edges = np.quantile(logd, np.linspace(0, 1, n_bins + 1))
+    # np.digitize on interior edges -> bin ids 0..n_bins-1
+    return np.digitize(logd, edges[1:-1])
+
+
+def degree_matched_sample(bin_of, seed_idx, exclude, rng):
+    """
+    Draw one replacement gene per seed from the same degree bin.
+    `exclude` holds indices that may never be drawn (all real HPs,
+    train and test, so the permuted set is disjoint from the real one).
+    Falls back to neighbouring bins if a bin is exhausted.
+    """
+    pool = defaultdict(list)
+    for i in range(len(bin_of)):
+        if i not in exclude:
+            pool[bin_of[i]].append(i)
+
+    n_bins = bin_of.max() + 1
+    used, sampled = set(), []
+
+    for s in seed_idx:
+        b = bin_of[s]
+        pick = None
+        for offset in range(n_bins):                      # widen search
+            for bb in {b - offset, b + offset}:
+                if bb < 0 or bb >= n_bins:
+                    continue
+                cands = [i for i in pool[bb] if i not in used]
+                if cands:
+                    pick = int(rng.choice(cands))
+                    break
+            if pick is not None:
+                break
+        if pick is None:
+            raise RuntimeError("Degree-matched pool exhausted")
+        used.add(pick)
+        sampled.append(pick)
+
+    return np.array(sampled, dtype=np.int64)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PIPELINE PIECES  (must match the main pipeline exactly)
+# ─────────────────────────────────────────────────────────────────────
+
+def rwr_fn(W, N, seeds, alpha=0.15, n_iter=50):
+    s = np.zeros(N, np.float32)
+    s[seeds] = 1.0 / len(seeds)
+    r = s.copy()
+    for _ in range(n_iter):
+        r = (1 - alpha) * (W.T @ r) + alpha * s
+    return r
+
+
+def max_cosim(E, tgt, sd):
+    tgt = np.asarray(tgt); sd = np.asarray(sd)
+    sim = (E[tgt] @ E[sd].T).astype(np.float32)
+    eq = tgt[:, None] == sd[None, :]
+    if eq.any():
+        sim = sim.copy(); sim[eq] = np.nan
+    m = np.nanmax(sim, axis=1)
+    return np.where(np.isnan(m), 0.0, m).astype(np.float32)
+
+
+def assemble(feat_keys, mods, omics, tgt, seeds, rwr_arr):
+    tgt = np.asarray(tgt); cols = []
+    for k in feat_keys:
+        if k == "max_seq":
+            cols.append(max_cosim(mods["seq"], tgt.tolist(), seeds))
+        elif k == "rwr":
+            cols.append(rwr_arr[tgt])
+        elif k == "mut":
+            cols.append(omics["mut"][tgt])
+        else:
+            raise ValueError(k)
+    return np.column_stack(cols).astype(np.float32)
+
+
+def cv_aupr(W, N, seed_set, bg_pool, mods, omics, n_repeats=N_REPEATS_CV):
+    """Repeated undersampling CV AUPR for a given seed set."""
+    out = []
+    for rep in range(n_repeats):
+        seed = BASE_SEED + rep
+        rng = np.random.default_rng(seed)
+        n_neg = min(len(seed_set) * NEG_RATIO, len(bg_pool))
+        neg = rng.choice(bg_pool, n_neg, replace=False)
+        pool = np.concatenate([seed_set, neg])
+        y = np.array([1] * len(seed_set) + [0] * len(neg), np.int32)
+        skf = StratifiedKFold(N_FOLDS, shuffle=True, random_state=seed)
+
+        oof = np.zeros(len(pool), np.float64)
+        for tr, va in skf.split(pool, y):
+            si = pool[tr][y[tr] == 1].tolist()
+            r = rwr_fn(W, N, si)
+            Xtr = assemble(LOCKED, mods, omics, pool[tr].tolist(), si, r)
+            Xva = assemble(LOCKED, mods, omics, pool[va].tolist(), si, r)
+            sc = StandardScaler().fit(Xtr)
+            clf = LogisticRegression(class_weight="balanced", max_iter=1000,
+                                     C=1.0, random_state=seed)
+            clf.fit(sc.transform(Xtr), y[tr])
+            oof[va] = clf.predict_proba(sc.transform(Xva))[:, 1]
+        out.append(average_precision_score(y, oof))
+    return float(np.mean(out))
+
+
+def genome_wide_top_n(W, N, seed_set, bg_pool, mods, omics, top_n=TOP_N):
+    """Fit on the full seed pool, score all genes, return top-N non-seed."""
+    rng = np.random.default_rng(BASE_SEED)
+    n_neg = min(len(seed_set) * NEG_RATIO, len(bg_pool))
+    neg = rng.choice(bg_pool, n_neg, replace=False)
+    pool = np.concatenate([seed_set, neg])
+    y = np.array([1] * len(seed_set) + [0] * len(neg), np.int32)
+
+    si = seed_set.tolist()
+    r = rwr_fn(W, N, si)
+    Xp = assemble(LOCKED, mods, omics, pool.tolist(), si, r)
+    Xa = assemble(LOCKED, mods, omics, list(range(N)), si, r)
+    sc = StandardScaler().fit(Xp)
+    clf = LogisticRegression(class_weight="balanced", max_iter=2000,
+                             C=1.0, random_state=BASE_SEED)
+    clf.fit(sc.transform(Xp), y)
+    scores = clf.predict_proba(sc.transform(Xa))[:, 1]
+
+    mask = np.ones(N, bool); mask[seed_set] = False
+    cand = np.where(mask)[0]
+    return cand[np.argsort(-scores[cand])[:top_n]]
+
+
+def subnetwork_modularity(G, gene_list):
+    """Leiden modularity of the induced subgraph on gene_list."""
+    sub = G.subgraph(gene_list)
+    if sub.number_of_edges() == 0:
+        return 0.0, 0
+    nl = list(sub.nodes())
+    g = ig.Graph()
+    g.add_vertices(len(nl))
+    idx = {n: i for i, n in enumerate(nl)}
+    g.add_edges([(idx[u], idx[v]) for u, v in sub.edges()])
+    part = leidenalg.find_partition(
+        g, leidenalg.RBConfigurationVertexPartition,
+        resolution_parameter=LEIDEN_GAMMA, seed=42)
+    sizes = np.bincount(part.membership)
+    n_mod = int((sizes >= MIN_MOD_SIZE).sum())
+    return float(part.modularity), n_mod
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────
+
+def run(genes, G, W, deg, mods, omics, train_hp, all_hp_idx,
+        real_top100_genes, n_perm=N_PERM):
+    """
+    genes             : list of gene names, index-aligned to W / deg / mods
+    G                 : networkx graph on the same gene names
+    W                 : row-normalised transition matrix
+    deg               : degree array
+    mods, omics       : preprocessed feature dicts ('seq'; 'mut')
+    train_hp          : np.array of 71 training seed indices
+    all_hp_idx        : set of ALL 88 HP indices (train + test), excluded
+                        from the permuted pools
+    real_top100_genes : the reported top-100 candidate gene names
+    """
+    N = len(genes)
+    bin_of = build_degree_bins(deg)
+    real_top = set(real_top100_genes)
+
+    # ── Observed values ────────────────────────────────────────────
+    bg_pool_real = np.array([i for i in range(N) if i not in all_hp_idx],
+                            dtype=np.int64)
+    obs_aupr = cv_aupr(W, N, train_hp, bg_pool_real, mods, omics)
+    obs_Q, obs_nmod = subnetwork_modularity(G, list(real_top))
+    print(f"OBSERVED  CV AUPR={obs_aupr:.4f}  Q={obs_Q:.4f}  modules={obs_nmod}")
+
+    rows = []
+    for p in range(n_perm):
+        rng = np.random.default_rng(10_000 + p)
+        perm_seeds = degree_matched_sample(bin_of, train_hp, all_hp_idx, rng)
+        bg_pool = np.array([i for i in range(N)
+                            if i not in all_hp_idx
+                            and i not in set(perm_seeds.tolist())],
+                           dtype=np.int64)
+
+        a = cv_aupr(W, N, perm_seeds, bg_pool, mods, omics)
+        top = genome_wide_top_n(W, N, perm_seeds, bg_pool, mods, omics)
+        top_genes = [genes[i] for i in top]
+        Q, nmod = subnetwork_modularity(G, top_genes)
+        ov = len(real_top & set(top_genes))
+
+        rows.append(dict(perm=p, cv_aupr=a, modularity=Q,
+                         n_modules=nmod, overlap_with_real=ov))
+        if (p + 1) % 10 == 0:
+            print(f"  {p+1}/{n_perm} done")
+
+    aupr_null = np.array([r["cv_aupr"] for r in rows])
+    q_null    = np.array([r["modularity"] for r in rows])
+    ov_null   = np.array([r["overlap_with_real"] for r in rows])
+
+    # one-sided empirical p: how often does the null match or exceed observed
+    p_aupr = (1 + (aupr_null >= obs_aupr).sum()) / (1 + len(aupr_null))
+    p_q    = (1 + (q_null    >= obs_Q).sum())    / (1 + len(q_null))
+
+    print("\n" + "=" * 62)
+    print(f"  CV AUPR    observed {obs_aupr:.4f} | null {aupr_null.mean():.4f} "
+          f"± {aupr_null.std():.4f} | p = {p_aupr:.4f}")
+    print(f"  Modularity observed {obs_Q:.4f} | null {q_null.mean():.4f} "
+          f"± {q_null.std():.4f} | p = {p_q:.4f}")
+    print(f"  Top-100 overlap with real list: {ov_null.mean():.1f} "
+          f"± {ov_null.std():.1f} genes (max {ov_null.max()})")
+    print("=" * 62)
+
+    import csv
+    with open(OUT_CSV, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    print(f"  Saved -> {OUT_CSV}")
+
+    return dict(obs_aupr=obs_aupr, obs_Q=obs_Q, p_aupr=p_aupr, p_q=p_q,
+                rows=rows)
+
+run_permutation = run
+# Example call (adapt names to your session):
+# run(genes=union_genes, G=G_union, W=W, deg=deg,
+#     mods=mods, omics=omics,
+#     train_hp=train_hp, all_hp_idx=all_hp_set,
+#     real_top100_genes=top100_genes)
