@@ -1,0 +1,168 @@
+"""
+
+This script repeats the community and hub analysis using ONLY the 100
+predicted candidates, and compares the result against the full 188-node
+network.
+
+Run GO-BP enrichment on the candidate-only module gene lists manually
+(DAVID), using the same background as the main analysis.
+
+Outputs
+-------
+  candidate_only_modules.csv  gene, module, z_score, participation, hub_class
+  console comparison table    188-node vs 100-node: Q, module count, sizes
+"""
+!pip install leidenalg
+import numpy as np
+import networkx as nx
+import leidenalg
+import igraph as ig
+import csv
+
+LEIDEN_GAMMA = 1.0
+MIN_MOD_SIZE = 6
+Z_THRESH     = 1.5
+PC_THRESH    = 0.5
+SEED         = 42
+
+
+def leiden_modules(G_sub):
+    """Leiden partition; returns module_of dict, Q, n_modules."""
+    nl = list(G_sub.nodes())
+    g = ig.Graph()
+    g.add_vertices(len(nl))
+    idx = {n: i for i, n in enumerate(nl)}
+    g.add_edges([(idx[u], idx[v]) for u, v in G_sub.edges()])
+
+    part = leidenalg.find_partition(
+        g, leidenalg.RBConfigurationVertexPartition,
+        resolution_parameter=LEIDEN_GAMMA, seed=SEED)
+
+    raw = {nl[i]: int(m) for i, m in enumerate(part.membership)}
+    sizes = {}
+    for m in raw.values():
+        sizes[m] = sizes.get(m, 0) + 1
+    module_of = {n: (m if sizes[m] >= MIN_MOD_SIZE else -1)
+                 for n, m in raw.items()}
+    n_mod = len({v for v in module_of.values() if v >= 0})
+    return module_of, float(part.modularity), n_mod
+
+
+def hub_cartography(G_sub, module_of):
+    """
+    Within-module degree z-score and participation coefficient.
+    PC uses TOTAL degree in the denominator (Guimera & Amaral 2005).
+    Nodes in sub-threshold modules are pooled into a single group (-1),
+    matching the main pipeline.
+    """
+    groups = {}
+    for n, m in module_of.items():
+        groups.setdefault(m, []).append(n)
+
+    z = {}
+    for m, ns in groups.items():
+        if m < 0:
+            for n in ns:
+                z[n] = 0.0
+            continue
+        nset = set(ns)
+        kw = {n: sum(1 for nb in G_sub.neighbors(n) if nb in nset) for n in ns}
+        vals = np.array(list(kw.values()), float)
+        if len(vals) <= 1 or vals.std() == 0:
+            for n in ns:
+                z[n] = 0.0
+        else:
+            mu, sd = vals.mean(), vals.std()
+            for n in ns:
+                z[n] = float((kw[n] - mu) / sd)
+
+    pc = {}
+    for n in G_sub.nodes():
+        nbrs = list(G_sub.neighbors(n))
+        ki = len(nbrs)
+        if ki == 0:
+            pc[n] = 0.0
+            continue
+        cnt = {}
+        for nb in nbrs:
+            m = module_of.get(nb, -1)
+            cnt[m] = cnt.get(m, 0) + 1
+        pc[n] = float(1.0 - sum((c / ki) ** 2 for c in cnt.values()))
+
+    hub = {}
+    for n in G_sub.nodes():
+        if z.get(n, 0.0) >= Z_THRESH:
+            hub[n] = "INTER_HUB" if pc.get(n, 0.0) > PC_THRESH else "INTRA_HUB"
+        else:
+            hub[n] = "NON_HUB"
+    return z, pc, hub
+
+
+def analyse(G, gene_list, label):
+    """Induced subgraph -> modules -> hubs. Returns a summary dict."""
+    sub = G.subgraph([g for g in gene_list if g in G])
+    module_of, Q, n_mod = leiden_modules(sub)
+    z, pc, hub = hub_cartography(sub, module_of)
+
+    sizes = {}
+    for m in module_of.values():
+        if m >= 0:
+            sizes[m] = sizes.get(m, 0) + 1
+
+    print(f"\n{label}")
+    print(f"  nodes={sub.number_of_nodes()}  edges={sub.number_of_edges()}")
+    print(f"  Q={Q:.4f}  modules={n_mod}  sizes={sorted(sizes.values(), reverse=True)}")
+    print(f"  inter-modular hubs: "
+          f"{[n for n, v in hub.items() if v == 'INTER_HUB']}")
+    print(f"  intra-modular hubs: "
+          f"{sum(1 for v in hub.values() if v == 'INTRA_HUB')}")
+
+    return dict(sub=sub, module_of=module_of, Q=Q, n_mod=n_mod,
+                z=z, pc=pc, hub=hub, sizes=sizes)
+
+
+def run(G, top100_genes, seed_genes, out_csv="/content/drive/MyDrive/MMSE BC (1)/candidate_only_modules.csv"):
+    """
+    G            : full PPI networkx graph (STRING u CPDB)
+    top100_genes : the 100 predicted candidates
+    seed_genes   : the 88 curated HP seeds
+    """
+    full = analyse(G, list(top100_genes) + list(seed_genes),
+                   "FULL 188-node subnetwork (candidates + seeds)")
+    cand = analyse(G, list(top100_genes),
+                   "CANDIDATE-ONLY subnetwork (100 predictions)")
+
+    # Write candidate-only assignments for manual GO-BP enrichment
+    rows = []
+    for n in cand["sub"].nodes():
+        rows.append(dict(gene=n,
+                         module=cand["module_of"].get(n, -1),
+                         z_score=round(cand["z"].get(n, 0.0), 4),
+                         participation=round(cand["pc"].get(n, 0.0), 4),
+                         hub_class=cand["hub"].get(n, "NON_HUB"),
+                         degree_in_subnetwork=cand["sub"].degree(n)))
+    rows.sort(key=lambda r: (r["module"], -r["degree_in_subnetwork"]))
+    with open(out_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    print(f"\n  Saved -> {out_csv}")
+
+    # Per-module gene lists, ready to paste into DAVID
+    print("\n  Candidate-only module membership (paste into DAVID):")
+    by_mod = {}
+    for r in rows:
+        by_mod.setdefault(r["module"], []).append(r["gene"])
+    for m in sorted(by_mod):
+        tag = "unassigned" if m < 0 else f"Module {m}"
+        print(f"\n  --- {tag} (n={len(by_mod[m])}) ---")
+        print("  " + ", ".join(by_mod[m]))
+
+    print(f"\n  COMPARISON  Q: {full['Q']:.4f} (188-node) vs "
+          f"{cand['Q']:.4f} (candidate-only)")
+    print(f"              modules: {full['n_mod']} vs {cand['n_mod']}")
+
+    return full, cand
+
+run_candidate_only = run
+# Example:
+# full, cand = run(G_union, top100_genes, seed_88_genes)
