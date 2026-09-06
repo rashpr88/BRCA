@@ -1,0 +1,99 @@
+"""
+Paired bootstrap of Delta-AUPR between SeqNetMut and each comparator.
+Uses COMMON resample indices so the difference is paired.
+
+"""
+
+import numpy as np
+from sklearn.metrics import average_precision_score
+
+N_BOOT = 2000
+SEED   = 2024
+
+
+def make_boot_indices(n, n_boot=N_BOOT, seed=SEED):
+    """Common resample indices, reused for every method comparison."""
+    rng = np.random.default_rng(seed)
+    return [rng.integers(0, n, n) for _ in range(n_boot)]
+
+
+def paired_delta_aupr(y, p_ref, p_cmp, boot_idx):
+    """
+    Paired bootstrap of AUPR(ref) - AUPR(cmp).
+
+    Returns observed delta, 95% CI, and a two-sided empirical p-value
+    (proportion of resamples where the delta crosses zero, doubled).
+    """
+    y = np.asarray(y)
+    obs = (average_precision_score(y, p_ref)
+           - average_precision_score(y, p_cmp))
+
+    deltas = []
+    for ix in boot_idx:
+        yy = y[ix]
+        if yy.sum() < 1 or (yy == 0).sum() < 1:
+            continue
+        deltas.append(average_precision_score(yy, p_ref[ix])
+                      - average_precision_score(yy, p_cmp[ix]))
+    deltas = np.array(deltas)
+
+    lo, hi = np.percentile(deltas, [2.5, 97.5])
+    # two-sided empirical p: how often the sign flips relative to observed
+    if obs >= 0:
+        p = 2.0 * (deltas <= 0).mean()
+    else:
+        p = 2.0 * (deltas >= 0).mean()
+    p = float(min(p, 1.0))
+
+    return dict(delta=float(obs), ci_lo=float(lo), ci_hi=float(hi),
+                p_value=p, n_valid=len(deltas))
+
+
+def run_all_comparisons(y_test, scores_by_method, ref_name="SeqNetMut"):
+    """
+    scores_by_method : dict name -> score array on the holdout
+    Prints a table and returns the results dict.
+    """
+    boot_idx = make_boot_indices(len(y_test))
+    p_ref = np.asarray(scores_by_method[ref_name], dtype=np.float64)
+
+    print(f"\n  Paired Delta-AUPR vs {ref_name} "
+          f"({len(boot_idx)} common resamples)")
+    print(f"  {'Comparator':<16} {'dAUPR':>8} {'95% CI':>18} {'p':>8}  {'sig?':>5}")
+    print("  " + "-" * 62)
+
+    out = {}
+    for name, s in scores_by_method.items():
+        if name == ref_name:
+            continue
+        r = paired_delta_aupr(y_test, p_ref,
+                              np.asarray(s, dtype=np.float64), boot_idx)
+        out[name] = r
+        sig = "YES" if r["p_value"] < 0.05 else "no"
+        print(f"  {name:<16} {r['delta']:>+8.4f} "
+              f"[{r['ci_lo']:+.3f},{r['ci_hi']:+.3f}] "
+              f"{r['p_value']:>8.4f}  {sig:>5}")
+
+    print("\n  Note: a CI excluding zero and p < 0.05 indicates a paired "
+          "difference,\n  even where marginal AUPR confidence intervals overlap.")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# B. Per-initialisation GNN reporting
+# ─────────────────────────────────────────────────────────────────────
+
+def gnn_per_run_metrics(per_run_scores, y_test):
+    """
+    per_run_scores : list of score arrays, one per random initialisation
+                     (i.e. `all_scores` before you take the mean)
+    Returns mean +/- SD of AUPR across initialisations, and the raw values.
+    """
+    auprs = [average_precision_score(y_test, s) for s in per_run_scores]
+    auprs = np.array(auprs)
+    return dict(mean=float(auprs.mean()), sd=float(auprs.std(ddof=1)),
+                values=[float(a) for a in auprs], n=len(auprs))
+
+
+
+#       f"(n={gcn_stats['n']} initialisations)")
